@@ -770,15 +770,25 @@ async def process_message(query_or_update, context, profile, use_message=False):
         context.user_data.pop(key, None)
 
     anon_note = " (анонімно)" if is_anonymous else ""
+    count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
     photo_note = "\n📷 З фото" if photo_file_id else ""
-    count_note = f"\n📊 Знайдено проблем: {len(results)}" if len(results) > 1 else ""
-    cats = ", ".join(categories)
+
+    result_lines = []
+    for i, r in enumerate(results):
+        if i > 0:
+            result_lines.append("")
+        icon = CATEGORY_ICONS.get(r.get('category', '—'), '📌')
+        result_lines.append(f"{icon} {r.get('category', '—')} · {r.get('urgency', '—')}")
+        result_lines.append(r.get('summary', '—'))
+    confirm_text = (
+        f"✅ Повідомлення надіслано{anon_note}!{count_note}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        + "\n".join(result_lines)
+        + f"\n━━━━━━━━━━━━━━━{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
+    )
 
     target_msg = query_or_update.message
-    sent = await target_msg.reply_text(
-        f"✅ Повідомлення надіслано{anon_note}!\n\n"
-        f"📂 Категорії: {cats}{count_note}{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
-    )
+    sent = await target_msg.reply_text(confirm_text)
     from telegram import Bot
     bot = Bot(token=BOT_TOKEN)
     # Видаляємо підтвердження через 90 сек
@@ -817,14 +827,24 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
         user_data.pop(key, None)
 
     anon_note = " (анонімно)" if is_anonymous else ""
+    count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
     photo_note = "\n📷 З фото" if photo_file_id else ""
-    cats = ", ".join(categories)
-    count_note = f"\n📊 Знайдено проблем: {len(results)}" if len(results) > 1 else ""
 
-    sent = await bot.send_message(
-        chat_id=chat_id,
-        text=f"✅ Повідомлення надіслано{anon_note}!\n\n📂 Категорії: {cats}{count_note}{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
+    result_lines = []
+    for i, r in enumerate(results):
+        if i > 0:
+            result_lines.append("")
+        icon = CATEGORY_ICONS.get(r.get('category', '—'), '📌')
+        result_lines.append(f"{icon} {r.get('category', '—')} · {r.get('urgency', '—')}")
+        result_lines.append(r.get('summary', '—'))
+    confirm_text = (
+        f"✅ Повідомлення надіслано{anon_note}!{count_note}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        + "\n".join(result_lines)
+        + f"\n━━━━━━━━━━━━━━━{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
     )
+
+    sent = await bot.send_message(chat_id=chat_id, text=confirm_text)
     if context:
         # Видаляємо підтвердження через 90 сек
         schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
