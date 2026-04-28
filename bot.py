@@ -32,7 +32,7 @@ SHEETS_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 SPREADSHEET_ID = os.getenv("FEEDBACK_SPREADSHEET_ID")
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x]
 
-RESTAURANTS = ["Терраса"]
+RESTAURANTS = ["Терраса", "Хочу", "Хочу 2.0"]
 ROLES = ["Офіціант", "Адміністратор", "Повар", "Шеф-повар", "Управляючий", "Виконавчий директор", "Технічний спеціаліст", "Клінінг"]
 ADMIN_ROLES = {"Управляючий", "Виконавчий директор"}
 KITCHEN_CATEGORIES = {"Кухня", "Закупки"}
@@ -106,7 +106,7 @@ assign_store = load_assign_store()
 PROMPT_FILE = os.path.join(os.path.dirname(__file__), "prompt.json")
 
 DEFAULT_PROMPT = """Ти помічник для аналізу повідомлень персоналу ресторану.
-Заклад: <<restaurant>>
+Заклад відправника: <<restaurant>>
 <<role_line>>Повідомлення: "<<message_text>>"
 
 Якщо в повідомленні є кілька різних проблем — поверни масив об'єктів. Якщо одна — масив з одного об'єкта.
@@ -114,6 +114,7 @@ DEFAULT_PROMPT = """Ти помічник для аналізу повідомл
 Поверни ТІЛЬКИ валідний JSON без пояснень та без markdown:
 [{"category": "Кухня|Сервіс|Техніка|Закупки|Гості|Ідеї|Чистота",
   "summary": "текст повідомлення як є, виправ лише явні описки та заїкання",
+  "restaurant": "Терраса|Хочу|Хочу 2.0",
   "responsible": "Шеф-повар|Управляючий|Виконавчий директор|Власник",
   "urgency": "Висока|Стандартна|Низька"}]
 
@@ -123,6 +124,14 @@ DEFAULT_PROMPT = """Ти помічник для аналізу повідомл
 - НЕ перефразовуй, НЕ скорочуй, НЕ інтерпретуй
 - Поганий приклад: "Бруд на підлозі" (скорочено і переінтерпретовано)
 - Гарний приклад: "в залі брудна підлога біля четвертого столика, гості скаржаться" (як сказав співробітник)
+
+Правила restaurant:
+- Визнач, про який заклад йдеться в тексті повідомлення
+- "Хочу 2.0", "Новий Хочу", "Хочу на Кабелянській" → "Хочу 2.0"
+- "Хочу на Лисенку" → "Хочу"
+- "Хочу" без уточнення → "Хочу"
+- "Терраса" → "Терраса"
+- Якщо заклад не згадується → "Терраса"
 
 Правила urgency:
 - Техніка зламалась → Висока
@@ -963,12 +972,13 @@ async def save_to_sheets(result, user_data, profile, has_photos=False):
             sheet.append_row(["Номер", "Дата", "Час", "Заклад", "Хто повідомив", "Роль", "Категорія", "Суть", "Відповідальний", "Терміновість", "Фото", "Статус", "Лог"])
 
         now = datetime.now()
-        feedback_id = generate_feedback_id(sheet, profile.get("restaurant", "X"))
+        detected_restaurant = result.get("restaurant", "Терраса")
+        feedback_id = generate_feedback_id(sheet, detected_restaurant)
 
         row = [
             feedback_id,
             now.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
-            profile.get("restaurant", "—"), user_data.get("sender_name", "—"), user_data.get("sender_role", "—"),
+            detected_restaurant, user_data.get("sender_name", "—"), user_data.get("sender_role", "—"),
             result.get("category", "—"), result.get("summary", "—"),
             result.get("responsible", "—"), result.get("urgency", "—"),
             "є фото" if has_photos else "—", "Нове", "Нове"
@@ -1022,8 +1032,9 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
         safe_id = (feedback_id or "").replace("-", "_")
         id_str = f"`{feedback_id}`" if feedback_id else ""
 
+        restaurant = result.get("restaurant", "Терраса")
         text = (
-            f"📌 {id_str} · {icon} *{category}*\n"
+            f"📌 {id_str} · {restaurant} · {icon} *{category}*\n"
             f"{result.get('summary', '—')}\n"
             f"_{now.strftime('%d.%m %H:%M')} · {sender}_"
         )
