@@ -1,4 +1,5 @@
 import logging
+import sys
 import os
 import asyncio
 import json
@@ -22,13 +23,13 @@ import tempfile
 import re
 import uuid
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(stream=sys.stdout, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-SHEETS_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+SHEETS_CREDENTIALS = os.path.join(os.path.dirname(__file__), os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json"))
 SPREADSHEET_ID = os.getenv("FEEDBACK_SPREADSHEET_ID")
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x]
 
@@ -324,7 +325,6 @@ async def start(update, context):
                 reply_markup=get_main_keyboard(user_id)
             )
             track_msg(msg.chat_id, msg.message_id)
-            schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
             return ConversationHandler.END
     await update.message.reply_text("Вітаю! 👋 Це бот для зворотного зв'язку персоналу.\n\nВведіть ваше *ім'я*:", parse_mode="Markdown")
     return ASK_FIRST_NAME
@@ -813,7 +813,8 @@ async def process_message(query_or_update, context, profile, use_message=False):
     )
 
     target_msg = query_or_update.message
-    sent = await target_msg.reply_text(confirm_text)
+    _uid = profile.get('telegram_id')
+    sent = await target_msg.reply_text(confirm_text, reply_markup=get_main_keyboard(_uid) if _uid else None)
     from telegram import Bot
     bot = Bot(token=BOT_TOKEN)
     # Видаляємо підтвердження через 90 сек
@@ -869,7 +870,7 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
         + f"\n━━━━━━━━━━━━━━━{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
     )
 
-    sent = await bot.send_message(chat_id=chat_id, text=confirm_text)
+    sent = await bot.send_message(chat_id=chat_id, text=confirm_text, reply_markup=get_main_keyboard(user_id))
     if context:
         # Видаляємо підтвердження через 90 сек
         schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
