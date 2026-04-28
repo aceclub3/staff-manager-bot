@@ -1940,7 +1940,7 @@ async def show_unresolved(query, context):
         # Очищуємо чат перед показом актуального списку задач
         await delete_tracked_messages(bot, [uid])
 
-        header = await bot.send_message(chat_id=uid, text=f"🔴 *Невиконані завдання: {len(unresolved)}*", parse_mode="Markdown")
+        header = await bot.send_message(chat_id=uid, text=f"🔴 *Невиконані завдання: {len(unresolved)}*", parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
         track_msg(uid, header.message_id)
 
         for row in unresolved:
