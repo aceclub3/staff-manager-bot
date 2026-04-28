@@ -20,6 +20,7 @@ from telegram.ext import (
 
 import tempfile
 import re
+import uuid
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -542,7 +543,7 @@ async def receive_voice(update, context):
     track_msg(processing_msg.chat_id, processing_msg.message_id)
     schedule_delete(context, _bot, processing_msg.chat_id, processing_msg.message_id, delay=AUTO_DELETE_DELAY)
     voice_file = await update.message.voice.get_file()
-    file_path = os.path.join(tempfile.gettempdir(), f"voice_{user_id}.ogg")
+    file_path = os.path.join(tempfile.gettempdir(), f"voice_{user_id}_{uuid.uuid4().hex[:8]}.ogg")
     await voice_file.download_to_drive(file_path)
     context.user_data['pending_message'] = file_path
     context.user_data['message_type'] = 'voice'
@@ -650,6 +651,13 @@ async def handle_send_option(update, context):
         context.user_data['is_anonymous'] = False
         await query.edit_message_text("📷 Надішліть фото — і повідомлення відправиться автоматично.")
         schedule_delete(context, _bot, query.message.chat_id, query.message.message_id, delay=MENU_DELETE_DELAY)
+        cancel_user_jobs(context, user_id, "photowait")
+        context.job_queue.run_once(
+            photo_waiting_clear_callback,
+            when=MENU_DELETE_DELAY,
+            name=f"photowait_{user_id}",
+            data={"user_id": user_id}
+        )
 
 
 async def receive_photo(update, context):
@@ -715,8 +723,15 @@ async def photo_clear_callback(context):
         except Exception:
             pass
 
+async def photo_waiting_clear_callback(context):
+    """Скидає waiting_for_photo якщо фото так і не надійшло після кнопки 'Додати фото'."""
+    user_id = context.job.data["user_id"]
+    user_data = context.application.user_data.get(user_id, {})
+    if user_data.get('waiting_for_photo'):
+        user_data.pop('waiting_for_photo', None)
+        user_data.pop('pending_message', None)
+        user_data.pop('message_type', None)
 
-GDRIVE_PHOTOS_PATH = r"G:\Мой диск\BOTS\Feedback\Фото"
 
 async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
     """Скачивает фото из Telegram и сохраняет в папку с датой."""
@@ -746,7 +761,8 @@ async def process_message(query_or_update, context, profile, use_message=False):
         text = pending
     if not text:
         target = query_or_update.message
-        await target.reply_text("❌ Не вдалося обробити повідомлення.")
+        context.user_data.pop('pending_photo', None)
+        await target.reply_text("❌ Не вдалося обробити повідомлення. Спробуйте ще раз.")
         return
 
     photo_file_id = context.user_data.pop('pending_photo', None)
