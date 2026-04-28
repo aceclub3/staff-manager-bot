@@ -390,7 +390,8 @@ async def notify_admins_new_registration(user_id, profile):
     ]])
     for admin_id in get_recipients():
         try:
-            await bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+            msg = await bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+            track_msg(admin_id, msg.message_id)
         except Exception as e:
             logger.error(f"Notify admin error {admin_id}: {e}")
 
@@ -1165,11 +1166,13 @@ async def handle_assign_to(update, context):
         from telegram import Bot
         bot_notify = Bot(token=BOT_TOKEN)
         try:
-            await bot_notify.send_message(
+            reassigned_msg = await bot_notify.send_message(
                 chat_id=old["assignee_id"],
                 text=f"❌ Завдання `{feedback_id}` передоручено іншому співробітнику.",
                 parse_mode="Markdown"
             )
+            track_msg(old["assignee_id"], reassigned_msg.message_id)
+            schedule_delete(context, bot_notify, old["assignee_id"], reassigned_msg.message_id, delay=AUTO_DELETE_DELAY)
         except Exception:
             pass
 
@@ -1206,6 +1209,8 @@ async def handle_assign_to(update, context):
             parse_mode="Markdown",
             reply_markup=assignee_keyboard
         )
+        track_msg(target_uid, msg.message_id)
+        schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
         if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict):
             existing = msg_store[feedback_id]["ids"].get(str(target_uid))
             if existing is None:
@@ -1519,7 +1524,8 @@ async def send_birthday_greetings(context):
             names = ", ".join(get_display_name(p) for _, p in birthday_users)
             for admin_id in get_recipients():
                 try:
-                    await bot.send_message(chat_id=admin_id, text=f"🎂 Сьогодні день народження у: *{names}*", parse_mode="Markdown")
+                    msg = await bot.send_message(chat_id=admin_id, text=f"🎂 Сьогодні день народження у: *{names}*", parse_mode="Markdown")
+                    track_msg(admin_id, msg.message_id)
                 except Exception as e:
                     logger.error(f"Birthday admin error: {e}")
     except Exception as e:
@@ -1854,6 +1860,9 @@ async def handle_admin_menu(update, context):
 
 async def show_unresolved(query, context):
     """Показує невиконані завдання з повною клавіатурою і історією."""
+    uid = query.from_user.id
+    from telegram import Bot
+    bot = Bot(token=BOT_TOKEN)
     try:
         gc = get_sheets_client()
         sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Зворотний зв'язок")
@@ -1871,11 +1880,12 @@ async def show_unresolved(query, context):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]))
             return
 
-        await query.edit_message_text(
-            f"🔴 *Невиконані завдання: {len(unresolved)}*",
-            parse_mode="Markdown"
-        )
-        uid = query.from_user.id
+        # Очищуємо чат перед показом актуального списку задач
+        await delete_tracked_messages(bot, [uid])
+
+        header = await bot.send_message(chat_id=uid, text=f"🔴 *Невиконані завдання: {len(unresolved)}*", parse_mode="Markdown")
+        track_msg(uid, header.message_id)
+
         for row in unresolved:
             fid = row.get("Номер", "—")
             safe_id = fid.replace("-", "_")
@@ -1884,7 +1894,9 @@ async def show_unresolved(query, context):
             stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
             text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
             try:
-                msg = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+                msg = await bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=keyboard)
+                track_msg(uid, msg.message_id)
+                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
                 if fid != "—":
                     if fid not in msg_store or not isinstance(msg_store.get(fid), dict):
                         msg_store[fid] = {"ids": {}, "text": text}
@@ -1901,7 +1913,10 @@ async def show_unresolved(query, context):
 
     except Exception as e:
         logger.error(f"Show unresolved error: {e}")
-        await query.edit_message_text("❌ Помилка при завантаженні завдань.")
+        try:
+            await query.message.reply_text("❌ Помилка при завантаженні завдань.")
+        except Exception:
+            pass
 
 
 # ─── УПРАВЛІННЯ ПЕРСОНАЛОМ ────────────────────────────────────────────────────
@@ -2020,7 +2035,8 @@ async def handle_new_role(update, context):
     ]])
     for admin_id in get_recipients():
         try:
-            await bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+            msg = await bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+            track_msg(admin_id, msg.message_id)
         except Exception as e:
             logger.error(f"Role change notify error: {e}")
     await query.edit_message_text(f"✅ Заявку на зміну ролі на *{new_role}* подано! Очікуйте підтвердження.", parse_mode="Markdown")
