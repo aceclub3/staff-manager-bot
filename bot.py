@@ -1500,7 +1500,7 @@ async def send_unresolved_digest(context):
                 done_text += f"✅ `{fid}` · {cat_icon} {summary}\n_{status}_\n\n"
             for uid in recipients:
                 try:
-                    msg = await bot.send_message(chat_id=uid, text=done_text.strip(), parse_mode="Markdown")
+                    msg = await bot.send_message(chat_id=uid, text=done_text.strip(), parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
                     track_msg(uid, msg.message_id)
                 except Exception as e:
                     logger.error(f"Digest done_yesterday error {uid}: {e}")
@@ -1510,7 +1510,8 @@ async def send_unresolved_digest(context):
                     msg = await bot.send_message(
                         chat_id=uid,
                         text=f"✅ *Вчора ({yesterday}) виконаних завдань немає.*",
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        reply_markup=get_main_keyboard(uid)
                     )
                     track_msg(uid, msg.message_id)
                 except Exception as e:
@@ -1520,7 +1521,7 @@ async def send_unresolved_digest(context):
         if not unresolved:
             for uid in recipients:
                 try:
-                    msg = await bot.send_message(chat_id=uid, text="🎉 *Всі завдання виконано!*", parse_mode="Markdown")
+                    msg = await bot.send_message(chat_id=uid, text="🎉 *Всі завдання виконано!*", parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
                     track_msg(uid, msg.message_id)
                 except Exception:
                     pass
