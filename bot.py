@@ -288,24 +288,33 @@ def cancel_user_jobs(context, user_id, job_prefix):
 
 async def start(update, context):
     user_id = update.effective_user.id
+    from telegram import Bot as _Bot
+    _bot = _Bot(token=BOT_TOKEN)
+    schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
     if user_id in user_profiles:
         profile = user_profiles[user_id]
         status = profile.get("status")
         if status == STATUS_PENDING:
-            await update.message.reply_text("⏳ Ваша заявка на реєстрацію очікує підтвердження від керівника. Ми повідомимо вас як тільки її розглянуть.")
+            msg = await update.message.reply_text("⏳ Ваша заявка на реєстрацію очікує підтвердження від керівника. Ми повідомимо вас як тільки її розглянуть.")
+            track_msg(msg.chat_id, msg.message_id)
+            schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
             return ConversationHandler.END
         if status == STATUS_FIRED:
-            await update.message.reply_text("❌ Ваш доступ відхилено. Зверніться до керівника.")
+            msg = await update.message.reply_text("❌ Ваш доступ відхилено. Зверніться до керівника.")
+            track_msg(msg.chat_id, msg.message_id)
+            schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
             return ConversationHandler.END
         if status == STATUS_ACTIVE:
             name = get_display_name(profile)
-            await update.message.reply_text(
+            msg = await update.message.reply_text(
                 f"З поверненням, {name}! 👋\n\n"
                 f"🏠 Заклад: {profile.get('restaurant', '—')}\n"
                 f"💼 Роль: {profile.get('role', '—')}\n\n"
                 "Надішліть повідомлення або скористайтесь кнопками.",
                 reply_markup=get_main_keyboard(user_id)
             )
+            track_msg(msg.chat_id, msg.message_id)
+            schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
             return ConversationHandler.END
     await update.message.reply_text("Вітаю! 👋 Це бот для зворотного зв'язку персоналу.\n\nВведіть ваше *ім'я*:", parse_mode="Markdown")
     return ASK_FIRST_NAME
