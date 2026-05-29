@@ -11,7 +11,7 @@ load_dotenv(dotenv_path=pathlib.Path(__file__).parent / "env")
 
 from openai import AsyncOpenAI
 import anthropic
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -22,9 +22,21 @@ from telegram.ext import (
 import tempfile
 import re
 import uuid
+import time
+import shutil
+import html
+import threading
+from telegram.error import BadRequest, RetryAfter, Forbidden, TimedOut, NetworkError
+from telegram.ext import PicklePersistence
+from telegram.helpers import escape_markdown
 
 logging.basicConfig(stream=sys.stdout, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def md(s):
+    """Екранує динамічний текст для legacy Markdown (parse_mode='Markdown')."""
+    return escape_markdown(str(s if s is not None else ""), version=1)
 
 BOT_TOKEN = os.getenv("FEEDBACK_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -57,18 +69,64 @@ ASK_FIRST_NAME, ASK_LAST_NAME, ASK_BIRTHDAY, ASK_PHONE, ASK_ROLE, ASK_RESTAURANT
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ─── НАДІЙНЕ ЗБЕРІГАННЯ JSON (атомарний запис + відновлення) ──────────────────
+
+def _atomic_write_json(path, data, ensure_ascii=False, indent=2):
+    """Атомарний запис: tmp у тій самій теці -> fsync -> os.replace. Тримає .bak."""
+    directory = os.path.dirname(path) or "."
+    try:
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=ensure_ascii, indent=indent)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Atomic write failed for {path}: {e}")
+
+
+def _safe_load_json(path, default):
+    """Читає JSON; при пошкодженні пробує .bak, потім default. Ніколи не падає."""
+    for candidate in (path, path + ".bak"):
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Load failed for {candidate}: {e}")
+                if candidate == path:
+                    # карантин пошкодженого файлу, щоб наступний кандидат (.bak) спрацював
+                    try:
+                        os.replace(path, path + ".corrupt")
+                    except Exception:
+                        pass
+    return default() if callable(default) else default
+
+
 PROFILES_FILE = os.path.join(os.path.dirname(__file__), "user_profiles.json")
 
 def load_profiles():
-    if os.path.exists(PROFILES_FILE):
-        with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    return {}
+    data = _safe_load_json(PROFILES_FILE, {})
+    try:
+        return {int(k): v for k, v in data.items()}
+    except Exception as e:
+        logger.error(f"Profiles parse error: {e}")
+        return {}
 
 def save_profiles(profiles):
-    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in profiles.items()}, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(PROFILES_FILE, {str(k): v for k, v in profiles.items()})
 
 user_profiles = load_profiles()
 
@@ -76,14 +134,21 @@ user_profiles = load_profiles()
 MSG_STORE_FILE = os.path.join(os.path.dirname(__file__), "message_store.json")
 
 def load_msg_store():
-    if os.path.exists(MSG_STORE_FILE):
-        with open(MSG_STORE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    data = _safe_load_json(MSG_STORE_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    # Одноразова міграція legacy-записів {uid: msg_id} -> {"ids":..., "text":"", "photo":None}
+    changed = False
+    for k, v in list(data.items()):
+        if isinstance(v, dict) and "ids" not in v:
+            data[k] = {"ids": v, "text": "", "photo": None}
+            changed = True
+    if changed:
+        _atomic_write_json(MSG_STORE_FILE, data)
+    return data
 
 def save_msg_store(store):
-    with open(MSG_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(MSG_STORE_FILE, store)
 
 msg_store = load_msg_store()
 
@@ -91,14 +156,11 @@ msg_store = load_msg_store()
 ASSIGN_STORE_FILE = os.path.join(os.path.dirname(__file__), "assign_store.json")
 
 def load_assign_store():
-    if os.path.exists(ASSIGN_STORE_FILE):
-        with open(ASSIGN_STORE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    data = _safe_load_json(ASSIGN_STORE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 def save_assign_store(store):
-    with open(ASSIGN_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(ASSIGN_STORE_FILE, store)
 
 assign_store = load_assign_store()
 
@@ -143,29 +205,32 @@ DEFAULT_PROMPT = """Ти помічник для аналізу повідомл
 Категорія Чистота: бруд, прибирання, гігієна"""
 
 def load_prompt():
-    if os.path.exists(PROMPT_FILE):
-        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("template", DEFAULT_PROMPT)
+    data = _safe_load_json(PROMPT_FILE, {})
+    if isinstance(data, dict) and data.get("template"):
+        return data["template"]
     return DEFAULT_PROMPT
 
 def save_prompt(template):
-    with open(PROMPT_FILE, "w", encoding="utf-8") as f:
-        json.dump({"template": template}, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(PROMPT_FILE, {"template": template})
 
 # ─── ТРЕКІНГ ПОВІДОМЛЕНЬ (для очищення перед дайджестом) ─────────────────────
 
 CHAT_MSGS_FILE = os.path.join(os.path.dirname(__file__), "chat_msgs.json")
 
 def load_chat_msgs():
-    if os.path.exists(CHAT_MSGS_FILE):
-        with open(CHAT_MSGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    data = _safe_load_json(CHAT_MSGS_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 def save_chat_msgs_data(data):
-    with open(CHAT_MSGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    # Некритичні дані (очищаються щодайджест) і пишуться дуже часто (track_msg) —
+    # тому без fsync/копії .bak: швидкий tmp+replace, щоб не блокувати event loop.
+    try:
+        tmp = CHAT_MSGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, CHAT_MSGS_FILE)
+    except Exception as e:
+        logger.error(f"chat_msgs save error: {e}")
 
 chat_msgs_store = load_chat_msgs()
 
@@ -258,6 +323,79 @@ def get_sheets_client():
     creds = Credentials.from_service_account_file(SHEETS_CREDENTIALS, scopes=scopes)
     return gspread.authorize(creds)
 
+
+# ─── КЕШ КЛІЄНТА + НАДІЙНИЙ ДОСТУП ДО ТАБЛИЦІ ────────────────────────────────
+
+SHEET_NAME = "Зворотний зв'язок"
+SHEET_HEADER = ["Номер", "Дата", "Час", "Заклад", "Хто повідомив", "Роль", "Категорія",
+                "Суть", "Відповідальний", "Терміновість", "Фото", "Статус", "Лог"]
+_gc = None
+_ws = None
+_sheet_lock = threading.Lock()   # gspread/AuthorizedSession не потокобезпечні — серіалізуємо доступ
+
+def _reset_sheets_cache():
+    global _gc, _ws
+    _gc = None
+    _ws = None
+
+def get_worksheet():
+    """Повертає аркуш, кешуючи авторизований клієнт (без реавторизації на кожен виклик)."""
+    global _gc, _ws
+    if _ws is not None:
+        return _ws
+    if _gc is None:
+        _gc = get_sheets_client()
+    ss = _gc.open_by_key(SPREADSHEET_ID)
+    try:
+        _ws = ss.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        _ws = ss.add_worksheet(SHEET_NAME, rows=1000, cols=13)
+        _ws.append_row(SHEET_HEADER)
+    return _ws
+
+def _sheet_retry(fn, attempts=3):
+    """Виконує синхронну операцію gspread з повтором і скиданням кешу при збої.
+    Лок тримається ЛИШЕ навколо самого виклику (gspread-сесія не потокобезпечна),
+    а backoff-пауза — поза локом, щоб не серіалізувати інші операції під час збою."""
+    last = None
+    for i in range(attempts):
+        try:
+            with _sheet_lock:
+                return fn()
+        except Exception as e:
+            last = e
+            logger.error(f"Sheets op failed (attempt {i+1}/{attempts}): {e}")
+            _reset_sheets_cache()
+            time.sleep(0.6 * (i + 1))
+    raise last
+
+async def _arun(fn):
+    """Виконує блокуючу функцію в executor, щоб не блокувати event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn)
+
+def _read_records():
+    """Стійке читання: get_all_values + нормалізація заголовків (не падає на дублях/порожніх)."""
+    ws = get_worksheet()
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    seen, norm = {}, []
+    for i, h in enumerate(headers):
+        h = (h or "").strip() or f"col{i+1}"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 1
+        norm.append(h)
+    out = []
+    for row in values[1:]:
+        row = list(row) + [""] * (len(norm) - len(row))
+        out.append({norm[i]: row[i] for i in range(len(norm))})
+    return out
+
 def get_main_keyboard(user_id):
     """Возвращает Reply-клавиатуру в зависимости от роли."""
     buttons = [[KeyboardButton("💬 Надіслати повідомлення")]]
@@ -277,6 +415,108 @@ async def safe_answer(query, text=None, show_alert=False):
             await query.answer()
     except Exception:
         pass
+
+
+# ─── СПІЛЬНИЙ BOT + СТІЙКА ВІДПРАВКА ──────────────────────────────────────────
+
+application = None          # встановлюється у main()
+_shared_bot = None          # резервний екземпляр, якщо application ще не готовий
+
+def get_bot():
+    """Повертає єдиний екземпляр Bot замість створення нового на кожен виклик."""
+    global _shared_bot
+    if application is not None:
+        return application.bot
+    if _shared_bot is None:
+        from telegram import Bot
+        _shared_bot = Bot(token=BOT_TOKEN)
+    return _shared_bot
+
+
+async def safe_send_message(bot, chat_id, text, reply_markup=None, parse_mode="Markdown", _retried=False):
+    """Надсилає повідомлення; при помилці розбору Markdown повторює як звичайний
+    текст, щоб повідомлення НІКОЛИ не зникало. Повертає Message або None."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest as e:
+        if parse_mode is not None:
+            try:
+                return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            except Exception as e2:
+                logger.error(f"safe_send plain fallback failed {chat_id}: {e2}")
+                return None
+        logger.error(f"safe_send BadRequest {chat_id}: {e}")
+        return None
+    except RetryAfter as e:
+        if not _retried:
+            await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
+            return await safe_send_message(bot, chat_id, text, reply_markup, parse_mode, _retried=True)
+        return None
+    except Forbidden:
+        return None  # користувач заблокував бота — не помилка
+    except (TimedOut, NetworkError) as e:
+        if not _retried:
+            await asyncio.sleep(1)
+            return await safe_send_message(bot, chat_id, text, reply_markup, parse_mode, _retried=True)
+        logger.error(f"safe_send network fail {chat_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"safe_send error {chat_id}: {e}")
+        return None
+
+
+async def safe_edit_message(bot, chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
+    """Редагує повідомлення; при помилці розбору Markdown повторює як звичайний
+    текст. Повертає True якщо повідомлення вдалося оновити (або воно не змінилось)."""
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text,
+                                    parse_mode=parse_mode, reply_markup=reply_markup)
+        return True
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "not modified" in msg:
+            return True
+        if "parse" in msg or "entities" in msg:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+                return True
+            except Exception as e2:
+                logger.error(f"safe_edit plain fallback {chat_id}/{message_id}: {e2}")
+                return False
+        return False  # повідомлення не знайдено / не можна редагувати
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text,
+                                        parse_mode=parse_mode, reply_markup=reply_markup)
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        logger.error(f"safe_edit error {chat_id}/{message_id}: {e}")
+        return False
+
+
+async def safe_send_photo(bot, chat_id, file_id=None, file_path=None, caption=None):
+    """Надсилає фото за file_id; при невдачі — з локального файлу (G:). Повертає Message або None."""
+    if file_id:
+        for attempt in range(2):
+            try:
+                return await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
+            except RetryAfter as e:
+                await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
+            except Forbidden:
+                return None
+            except Exception as e:
+                logger.error(f"send_photo by file_id failed {chat_id}: {e}")
+                break
+    if file_path and os.path.exists(file_path):
+        try:
+            with open(file_path, "rb") as fh:
+                return await bot.send_photo(chat_id=chat_id, photo=fh, caption=caption)
+        except Exception as e:
+            logger.error(f"send_photo by path failed {chat_id}: {e}")
+    return None
 
 def schedule_delete(context, bot, chat_id, message_id, delay, job_name=None):
     """Планує видалення повідомлення через delay секунд."""
@@ -299,8 +539,7 @@ def cancel_user_jobs(context, user_id, job_prefix):
 
 async def start(update, context):
     user_id = update.effective_user.id
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
     if user_id in user_profiles:
         profile = user_profiles[user_id]
@@ -395,8 +634,7 @@ async def ask_restaurant_reg(update, context):
     return ConversationHandler.END
 
 async def notify_admins_new_registration(user_id, profile):
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     full_name = get_display_name(profile)
     text = (
         f"🆕 *Нова заявка на реєстрацію*\n\n"
@@ -429,8 +667,7 @@ async def handle_approve(update, context):
     profile = user_profiles[user_id]
     full_name = get_display_name(profile)
     await query.edit_message_text(f"✅ {full_name} — підтверджено!")
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     try:
         await bot.send_message(chat_id=user_id, text=f"✅ Вашу реєстрацію підтверджено!\n\nЛаскаво просимо, {profile.get('first_name')}! 🎉\nТепер ви можете надсилати повідомлення.", reply_markup=get_main_keyboard(user_id))
     except Exception as e:
@@ -450,8 +687,7 @@ async def handle_reject(update, context):
     save_profiles(user_profiles)
     full_name = get_display_name(user_profiles[user_id])
     await query.edit_message_text(f"❌ {full_name} — відхилено.")
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     try:
         await bot.send_message(chat_id=user_id, text="❌ Вашу заявку на реєстрацію відхилено. Зверніться до керівника.")
     except Exception as e:
@@ -465,8 +701,7 @@ async def receive_text(update, context):
     text = update.message.text
 
     # Автовидалення повідомлення користувача
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
 
     if text == "👨‍💼 Адмін-меню":
@@ -523,8 +758,7 @@ async def receive_voice(update, context):
     user_id = update.effective_user.id
 
     # Автовидалення голосового повідомлення користувача
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
 
     # Режим редагування промпту (тільки для власника)
@@ -578,8 +812,7 @@ async def ask_send_options(update, context):
     context.user_data['option_chat_id'] = msg.chat_id
     context.user_data['waiting_for_option'] = True
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     # Видаляємо через 25 сек (трохи більше таймера автовідправки)
     schedule_delete(context, bot, msg.chat_id, msg.message_id, delay=25,
                     job_name=f"optdelete_{user_id}")
@@ -607,8 +840,7 @@ async def auto_send_callback(context):
     user_data['pending_photo'] = user_data.get('pending_photo')
     user_data['waiting_for_option'] = False
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
 
     try:
         await bot.edit_message_text(
@@ -634,8 +866,7 @@ async def handle_send_option(update, context):
     profile = user_profiles.get(user_id, {})
     action = query.data
 
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
 
     if action == "send_named":
         context.user_data['sender_name'] = get_display_name(profile)
@@ -677,8 +908,7 @@ async def receive_photo(update, context):
         return
 
     # Автовидалення фото користувача
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
 
     photo_file_id = update.message.photo[-1].file_id
@@ -701,8 +931,7 @@ async def receive_photo(update, context):
             "_Якщо нічого не надійде протягом 2 хв — фото буде скинуто._",
             parse_mode="Markdown"
         )
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         # Видаляємо підказку разом із таймаутом фото
         schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=120,
                         job_name=f"photomsgdelete_{user_id}")
@@ -723,8 +952,7 @@ async def photo_clear_callback(context):
     user_data = context.application.user_data.get(user_id, {})
     if 'pending_photo' in user_data and 'pending_message' not in user_data:
         user_data.pop('pending_photo', None)
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             sent = await bot.send_message(chat_id=chat_id, text="⏱ Час вийшов. Фото скинуто. Надішліть повідомлення знову.")
             # Видаляємо системне повідомлення через 30 сек
@@ -743,10 +971,9 @@ async def photo_waiting_clear_callback(context):
 
 
 async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
-    """Скачивает фото из Telegram и сохраняет в папку с датой."""
+    """Скачивает фото из Telegram и сохраняет в папку с датой. Повертає шлях або ''."""
     try:
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         tg_file = await bot.get_file(file_id)
 
         today_folder = os.path.join(GDRIVE_PHOTOS_PATH, datetime.now().strftime("%Y-%m-%d"))
@@ -761,43 +988,31 @@ async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
         return ""
 
 
-async def process_message(query_or_update, context, profile, use_message=False):
-    message_type = context.user_data.get('message_type')
-    pending = context.user_data.get('pending_message')
-    if message_type == 'voice':
-        text = await transcribe_voice(pending)
-    else:
-        text = pending
-    if not text:
-        target = query_or_update.message
-        context.user_data.pop('pending_photo', None)
-        await target.reply_text("❌ Не вдалося обробити повідомлення. Спробуйте ще раз.")
-        return
-
-    photo_file_id = context.user_data.pop('pending_photo', None)
-    is_anonymous = context.user_data.get('is_anonymous', False)
-    now = datetime.now()
-
+async def _save_and_notify(results, user_data, profile, photo_file_id, context):
+    """Зберігає фото на диск (раз), створює задачі в таблиці й розсилає сповіщення.
+    Фото-file_id зберігається для КОЖНОЇ підзадачі (щоб дайджест міг його показати),
+    але живе фото шлеться лише для першої. Повертає (categories, feedback_ids)."""
+    gdrive_path = ""
     if photo_file_id:
-        filename = f"feedback_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
-        await save_photo_to_gdrive(photo_file_id, filename)
-
-    results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-
-    categories = []
+        filename = f"feedback_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.jpg"
+        gdrive_path = await save_photo_to_gdrive(photo_file_id, filename)
+    categories, ids = [], []
     for i, result in enumerate(results):
-        photo = photo_file_id if i == 0 else None
-        feedback_id = await save_to_sheets(result, context.user_data, profile, has_photos=photo is not None)
-        await send_notifications(result, context.user_data, profile, photo, feedback_id, context=context)
+        feedback_id = await save_to_sheets(result, user_data, profile, has_photos=bool(photo_file_id))
+        await send_notifications(result, user_data, profile,
+                                 photo_file_id=photo_file_id, feedback_id=feedback_id, context=context,
+                                 photo_path=gdrive_path, send_live_photo=(i == 0))
         categories.append(result.get('category', '—'))
+        ids.append(feedback_id)
+    return categories, ids
 
-    for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
-        context.user_data.pop(key, None)
 
+def _build_confirm_text(results, is_anonymous, photo_file_id, ids):
     anon_note = " (анонімно)" if is_anonymous else ""
     count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
     photo_note = "\n📷 З фото" if photo_file_id else ""
-
+    warn_note = ("\n⚠️ Тимчасово не збережено в таблицю (показано лише в чаті)."
+                 if any(str(i).startswith("LOCAL-") for i in ids) else "")
     result_lines = []
     for i, r in enumerate(results):
         if i > 0:
@@ -805,20 +1020,48 @@ async def process_message(query_or_update, context, profile, use_message=False):
         icon = CATEGORY_ICONS.get(r.get('category', '—'), '📌')
         result_lines.append(f"{icon} {r.get('category', '—')} · {r.get('urgency', '—')}")
         result_lines.append(r.get('summary', '—'))
-    confirm_text = (
+    return (
         f"✅ Повідомлення надіслано{anon_note}!{count_note}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         + "\n".join(result_lines)
-        + f"\n━━━━━━━━━━━━━━━{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
+        + f"\n━━━━━━━━━━━━━━━{photo_note}{warn_note}\n\nДякуємо за зворотний зв'язок 🙏"
     )
 
-    target_msg = query_or_update.message
+
+async def process_message(query_or_update, context, profile, use_message=False):
+    message_type = context.user_data.get('message_type')
+    pending = context.user_data.get('pending_message')
+    if message_type == 'voice':
+        text = await transcribe_voice(pending)
+    else:
+        text = pending
+    target = query_or_update.message
+    if not text:
+        # Фото НЕ скидаємо — даємо шанс повторити опис; перезапускаємо 2-хв таймер очищення.
+        context.user_data.pop('pending_message', None)
+        context.user_data.pop('message_type', None)
+        _uid = profile.get('telegram_id')
+        if context.user_data.get('pending_photo') and _uid:
+            cancel_user_jobs(context, _uid, "photoclear")
+            context.job_queue.run_once(photo_clear_callback, when=120, name=f"photoclear_{_uid}",
+                                       data={"user_id": _uid, "chat_id": target.chat_id})
+        await target.reply_text("❌ Не вдалося обробити повідомлення. Спробуйте ще раз.")
+        return
+
+    photo_file_id = context.user_data.pop('pending_photo', None)
+    is_anonymous = context.user_data.get('is_anonymous', False)
+
+    results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
+    categories, ids = await _save_and_notify(results, context.user_data, profile, photo_file_id, context)
+
+    for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
+        context.user_data.pop(key, None)
+
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
     _uid = profile.get('telegram_id')
-    sent = await target_msg.reply_text(confirm_text, reply_markup=get_main_keyboard(_uid) if _uid else None)
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    sent = await target.reply_text(confirm_text, reply_markup=get_main_keyboard(_uid) if _uid else None)
     # Видаляємо підтвердження через 90 сек
-    schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=90)
+    schedule_delete(context, get_bot(), sent.chat_id, sent.message_id, delay=90)
 
 async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     """Вспомогательная функция для автоотправки (без query объекта)."""
@@ -829,49 +1072,27 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     else:
         text = pending
     if not text:
-        await bot.send_message(chat_id=chat_id, text="❌ Не вдалося обробити повідомлення.")
+        user_data.pop('pending_message', None)
+        user_data.pop('message_type', None)
+        if user_data.get('pending_photo') and context:
+            cancel_user_jobs(context, user_id, "photoclear")
+            context.job_queue.run_once(photo_clear_callback, when=120, name=f"photoclear_{user_id}",
+                                       data={"user_id": user_id, "chat_id": chat_id})
+        await safe_send_message(bot, chat_id, "❌ Не вдалося обробити повідомлення.", parse_mode=None)
         return
 
     photo_file_id = user_data.pop('pending_photo', None)
     is_anonymous = user_data.get('is_anonymous', False)
-    now = datetime.now()
-
-    if photo_file_id:
-        filename = f"feedback_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
-        await save_photo_to_gdrive(photo_file_id, filename)
 
     results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-
-    categories = []
-    for i, result in enumerate(results):
-        photo = photo_file_id if i == 0 else None
-        feedback_id = await save_to_sheets(result, user_data, profile, has_photos=photo is not None)
-        await send_notifications(result, user_data, profile, photo, feedback_id, context=context)
-        categories.append(result.get('category', '—'))
+    categories, ids = await _save_and_notify(results, user_data, profile, photo_file_id, context)
 
     for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo']:
         user_data.pop(key, None)
 
-    anon_note = " (анонімно)" if is_anonymous else ""
-    count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
-    photo_note = "\n📷 З фото" if photo_file_id else ""
-
-    result_lines = []
-    for i, r in enumerate(results):
-        if i > 0:
-            result_lines.append("")
-        icon = CATEGORY_ICONS.get(r.get('category', '—'), '📌')
-        result_lines.append(f"{icon} {r.get('category', '—')} · {r.get('urgency', '—')}")
-        result_lines.append(r.get('summary', '—'))
-    confirm_text = (
-        f"✅ Повідомлення надіслано{anon_note}!{count_note}\n\n"
-        f"━━━━━━━━━━━━━━━\n"
-        + "\n".join(result_lines)
-        + f"\n━━━━━━━━━━━━━━━{photo_note}\n\nДякуємо за зворотний зв'язок 🙏"
-    )
-
-    sent = await bot.send_message(chat_id=chat_id, text=confirm_text, reply_markup=get_main_keyboard(user_id))
-    if context:
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
+    sent = await safe_send_message(bot, chat_id, confirm_text, reply_markup=get_main_keyboard(user_id), parse_mode=None)
+    if context and sent:
         # Видаляємо підтвердження через 90 сек
         schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
 
@@ -890,7 +1111,55 @@ async def transcribe_voice(file_path):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+def _retry_sync(fn, attempts=2, delay=1.0):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            logger.error(f"Claude call failed (attempt {i+1}/{attempts}): {e}")
+            time.sleep(delay * (i + 1))
+    raise last
+
+def _strip_code_fences(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _extract_json(s):
+    """Витягує JSON навіть якщо модель обгорнула його у ```json або додала текст."""
+    s = _strip_code_fences(s)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    for open_c, close_c in (("[", "]"), ("{", "}")):
+        start, end = s.find(open_c), s.rfind(close_c)
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(s[start:end + 1])
+            except Exception:
+                continue
+    return None
+
+def _call_claude_sync(prompt, max_tokens=800):
+    return claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
 async def analyze_with_claude(text, profile, is_anonymous=False):
+    fallback_restaurant = profile.get('restaurant', 'Терраса') or 'Терраса'
+
+    def _fallback():
+        # ВЕСЬ текст як summary (без обрізання до 50 символів) + коректний заклад
+        return [{"category": "Інше", "summary": text, "responsible": "Управляючий",
+                 "urgency": "Стандартна", "restaurant": fallback_restaurant}]
+
     try:
         role_line = "" if is_anonymous else f"Роль відправника: {profile.get('role', 'Невідомо')}\n"
         template = load_prompt()
@@ -898,21 +1167,33 @@ async def analyze_with_claude(text, profile, is_anonymous=False):
             .replace("<<restaurant>>", profile.get('restaurant', 'Невідомо'))
             .replace("<<role_line>>", role_line)
             .replace("<<message_text>>", text))
-
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        response = await _arun(lambda: _retry_sync(lambda: _call_claude_sync(prompt)))
         raw = response.content[0].text.strip()
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        return parsed
-
     except Exception as e:
-        logger.error(f"Claude error: {e}")
-        return [{"category": "Інше", "summary": text[:50], "action": "Переглянути вручну", "responsible": "Управляючий", "urgency": "Стандартна"}]
+        logger.error(f"Claude API error: {e}")
+        return _fallback()
+
+    parsed = _extract_json(raw)
+    if parsed is None:
+        logger.error("Claude JSON parse failed; using raw text as summary")
+        return _fallback()
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+
+    norm = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        cat = item.get("category", "Інше")
+        if cat not in CATEGORIES and cat != "Інше":
+            cat = "Інше"
+        item["category"] = cat
+        if not item.get("restaurant"):
+            item["restaurant"] = fallback_restaurant
+        if not item.get("summary"):
+            item["summary"] = text
+        norm.append(item)
+    return norm if norm else _fallback()
 
 
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
@@ -925,23 +1206,18 @@ def get_msg_data(feedback_id):
     return data, ""
 
 async def edit_all_messages(bot, feedback_id, new_text, keyboard):
-    """Редагує повідомлення у всіх отримувачів і оновлює збережений текст."""
+    """Редагує повідомлення у всіх отримувачів і оновлює збережений текст.
+    Текст зберігається лише якщо хоч одне редагування вдалося — щоб некоректний
+    Markdown не «отруїв» збережений текст і не сховав задачу в наступному дайджесті."""
     msg_ids, _ = get_msg_data(feedback_id)
-    for uid_str, message_id in msg_ids.items():
-        # Підтримуємо як один id (int), так і список [id1, id2, ...]
+    any_ok = False
+    for uid_str, message_id in list(msg_ids.items()):
         ids = message_id if isinstance(message_id, list) else [message_id]
         for mid in ids:
-            try:
-                await bot.edit_message_text(
-                    chat_id=int(uid_str),
-                    message_id=mid,
-                    text=new_text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
-            except Exception as e:
-                logger.error(f"Edit message error {uid_str}/{mid}: {e}")
-    if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict):
+            ok = await safe_edit_message(bot, int(uid_str), mid, new_text,
+                                         reply_markup=keyboard, parse_mode="Markdown")
+            any_ok = any_ok or ok
+    if any_ok and feedback_id in msg_store and isinstance(msg_store[feedback_id], dict):
         msg_store[feedback_id]["text"] = new_text
         save_msg_store(msg_store)
 
@@ -963,19 +1239,12 @@ def generate_feedback_id(sheet, restaurant):
     return f"{id_prefix}{next_num}"
 
 async def save_to_sheets(result, user_data, profile, has_photos=False):
-    try:
-        gc = get_sheets_client()
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-        try:
-            sheet = spreadsheet.worksheet("Зворотний зв'язок")
-        except gspread.WorksheetNotFound:
-            sheet = spreadsheet.add_worksheet("Зворотний зв'язок", rows=1000, cols=13)
-            sheet.append_row(["Номер", "Дата", "Час", "Заклад", "Хто повідомив", "Роль", "Категорія", "Суть", "Відповідальний", "Терміновість", "Фото", "Статус", "Лог"])
+    detected_restaurant = result.get("restaurant", "Терраса")
 
+    def _do():
+        ws = get_worksheet()
+        feedback_id = generate_feedback_id(ws, detected_restaurant)
         now = datetime.now()
-        detected_restaurant = result.get("restaurant", "Терраса")
-        feedback_id = generate_feedback_id(sheet, detected_restaurant)
-
         row = [
             feedback_id,
             now.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
@@ -984,47 +1253,63 @@ async def save_to_sheets(result, user_data, profile, has_photos=False):
             result.get("responsible", "—"), result.get("urgency", "—"),
             "є фото" if has_photos else "—", "Нове", "Нове"
         ]
-        sheet.insert_row(row, index=2)
+        ws.insert_row(row, index=2)
+        return feedback_id
+
+    try:
+        feedback_id = await _arun(lambda: _sheet_retry(_do))
         logger.info(f"Saved to Sheets ID {feedback_id}: {result.get('category')} / {result.get('urgency')}")
         return feedback_id
     except Exception as e:
-        logger.error(f"Sheets error: {e}")
-        return None
+        # Таблиця недоступна навіть після повторів — даємо локальний id,
+        # щоб задача лишалась керованою в Telegram (кнопки/коментарі працюють).
+        local_id = "LOCAL-" + uuid.uuid4().hex[:6].upper()
+        logger.error(f"Sheets save failed, using local id {local_id}: {e}")
+        return local_id
 
 async def update_sheet_history(feedback_id, entry):
-    """Додає запис в колонку Історія (col 13)."""
-    try:
-        gc = get_sheets_client()
-        sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Зворотний зв'язок")
-        all_ids = sheet.col_values(1)
+    """Додає запис в колонку Лог (col 13)."""
+    if not feedback_id or str(feedback_id).startswith("LOCAL-"):
+        return
+    def _do():
+        ws = get_worksheet()
+        all_ids = ws.col_values(1)
         for i, val in enumerate(all_ids):
             if val == feedback_id:
-                current = sheet.cell(i + 1, 13).value or ""
+                current = ws.cell(i + 1, 13).value or ""
                 new_history = (current + " | " + entry).strip(" | ")
-                sheet.update_cell(i + 1, 13, new_history)
+                ws.update_cell(i + 1, 13, new_history)
                 return
+    try:
+        await _arun(lambda: _sheet_retry(_do))
     except Exception as e:
         logger.error(f"History update error: {e}")
 
 async def update_sheet_status(feedback_id, status, who):
-    """Обновляет статус строки в Google Sheets по ID."""
-    try:
-        gc = get_sheets_client()
-        sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Зворотний зв'язок")
-        all_ids = sheet.col_values(1)
+    """Оновлює статус рядка в Google Sheets за ID."""
+    if not feedback_id or str(feedback_id).startswith("LOCAL-"):
+        return
+    def _do():
+        ws = get_worksheet()
+        all_ids = ws.col_values(1)
         for i, val in enumerate(all_ids):
             if val == feedback_id:
-                sheet.update_cell(i + 1, 12, f"{status}" + (f" — {who}" if who else ""))
-                logger.info(f"Status updated ID {feedback_id}: {status}")
-                return
-        logger.warning(f"ID {feedback_id} not found in sheet")
+                ws.update_cell(i + 1, 12, f"{status}" + (f" — {who}" if who else ""))
+                return True
+        return False
+    try:
+        found = await _arun(lambda: _sheet_retry(_do))
+        if found:
+            logger.info(f"Status updated ID {feedback_id}: {status}")
+        else:
+            logger.warning(f"ID {feedback_id} not found in sheet")
     except Exception as e:
         logger.error(f"Sheet status update error: {e}")
 
-async def send_notifications(result, user_data, profile, photo_file_id=None, feedback_id=None, context=None):
+async def send_notifications(result, user_data, profile, photo_file_id=None, feedback_id=None,
+                             context=None, photo_path="", send_live_photo=True):
     try:
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         category = result.get("category", "—")
         icon = CATEGORY_ICONS.get(category, "📌")
         sender = user_data.get("sender_name", "Аноним")
@@ -1035,9 +1320,9 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
 
         restaurant = result.get("restaurant", "Терраса")
         text = (
-            f"📌 {id_str} · {restaurant} · {icon} *{category}*\n"
-            f"{result.get('summary', '—')}\n"
-            f"_{now.strftime('%d.%m %H:%M')} · {sender}_"
+            f"📌 {id_str} · {md(restaurant)} · {icon} *{md(category)}*\n"
+            f"{md(result.get('summary', '—'))}\n"
+            f"_{now.strftime('%d.%m %H:%M')} · {md(sender)}_"
         )
 
         keyboard = build_task_keyboard(safe_id)
@@ -1047,31 +1332,35 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
         logger.info(f"Sending notifications: category={category}, recipients={len(recipients)}, photo={'yes' if photo_file_id else 'no'}")
 
         for uid in recipients:
-            # Текстове повідомлення
-            try:
-                msg = await bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=keyboard)
-                msg_ids[str(uid)] = msg.message_id
-                track_msg(uid, msg.message_id)
-                if context:
-                    schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
-                logger.info(f"Text notification sent to {uid}")
-            except Exception as e:
-                logger.error(f"Notify text error {uid}: {e}")
+            msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
+            if msg is None:
                 continue
+            msg_ids[str(uid)] = msg.message_id
+            track_msg(uid, msg.message_id)
+            if context:
+                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
 
-            # Фото — окремий try/except щоб не блокувати решту
-            if photo_file_id:
-                try:
-                    photo_msg = await bot.send_photo(chat_id=uid, photo=photo_file_id)
+            # Живе фото шлемо лише для першої підзадачі (щоб не дублювати), але file_id
+            # зберігаємо для КОЖНОЇ задачі нижче — щоб дайджест міг показати фото будь-якій.
+            if photo_file_id and send_live_photo:
+                photo_msg = await safe_send_photo(bot, uid, file_id=photo_file_id, file_path=photo_path)
+                if photo_msg is not None:
                     track_msg(uid, photo_msg.message_id)
                     if context:
                         schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
-                    logger.info(f"Photo sent to {uid}, file_id={photo_file_id}")
-                except Exception as e:
-                    logger.error(f"Photo send error to {uid}: {e}")
 
-        if feedback_id and msg_ids:
-            msg_store[feedback_id] = {"ids": msg_ids, "text": text}
+        # Зберігаємо ЗАВЖДИ, коли є feedback_id (навіть якщо жодна відправка не вдалась) —
+        # щоб текст і фото можна було відновити в дайджесті / ручному переліку.
+        if feedback_id:
+            entry = msg_store.get(feedback_id)
+            if not (isinstance(entry, dict) and "ids" in entry):
+                entry = {"ids": {}, "text": text, "photo": None, "photo_path": ""}
+            entry["ids"].update(msg_ids)
+            entry["text"] = text
+            if photo_file_id:
+                entry["photo"] = photo_file_id
+                entry["photo_path"] = photo_path or entry.get("photo_path", "")
+            msg_store[feedback_id] = entry
             save_msg_store(msg_store)
 
     except Exception as e:
@@ -1112,10 +1401,9 @@ async def handle_status_update(update, context):
         if not is_owner(user_id):
             await safe_answer(query, "Тільки власник може видаляти.", show_alert=True)
             return
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         msg_ids, _ = get_msg_data(feedback_id)
-        for uid_str, mid in msg_ids.items():
+        for uid_str, mid in list(msg_ids.items()):
             ids = mid if isinstance(mid, list) else [mid]
             for m in ids:
                 try:
@@ -1125,33 +1413,43 @@ async def handle_status_update(update, context):
         if feedback_id in msg_store:
             del msg_store[feedback_id]
             save_msg_store(msg_store)
+        if feedback_id in assign_store:
+            assign_store.pop(feedback_id, None)
+            save_assign_store(assign_store)
         asyncio.create_task(update_sheet_status(feedback_id, "Видалено", who))
         asyncio.create_task(update_sheet_history(feedback_id, f"🗑️ Видалено — {who} {now}"))
         return
     # ─────────────────────────────────────────────────────────────────────────
 
     if action == "done":
-        status_text = f"✅ Виконано — {who} {now}"
+        status_text = f"✅ Виконано — {md(who)} {now}"
         new_keyboard = build_task_keyboard(safe_id, assigned=assigned, done=True)
         sheet_status = f"Виконано — {who}"
         history_entry = f"✅ Виконано — {who} {now}"
+        # завершену задачу знімаємо з доручення (щоб 'Доручено' не висіло вічно)
+        if feedback_id in assign_store:
+            assign_store.pop(feedback_id, None)
+            save_assign_store(assign_store)
     elif action == "wip":
-        status_text = f"🔄 В роботі — {who} {now}"
+        status_text = f"🔄 В роботі — {md(who)} {now}"
         new_keyboard = build_wip_keyboard(safe_id, assigned=assigned)
         sheet_status = f"В роботі — {who}"
         history_entry = f"🔄 В роботі — {who} {now}"
     else:  # cancel
-        status_text = f"↩️ Скасовано — {who} {now}"
+        status_text = f"↩️ Скасовано — {md(who)} {now}"
         new_keyboard = build_task_keyboard(safe_id, assigned=assigned)
         sheet_status = "Нове"
         history_entry = f"↩️ Скасовано — {who} {now}"
 
     _, stored_text = get_msg_data(feedback_id)
     base_text = stored_text if stored_text else query.message.text
-    new_text = base_text + f"\n{status_text}"
+    # прибираємо лише попередні СТАТУСНІ рядки (за повним префіксом бота),
+    # щоб випадково не вирізати опис, який міг початись з ✅/🔄/↩️
+    status_prefixes = ("✅ Виконано", "🔄 В роботі", "↩️ Скасовано")
+    base_lines = [l for l in base_text.split("\n") if not l.lstrip().startswith(status_prefixes)]
+    new_text = "\n".join(base_lines).rstrip() + f"\n{status_text}"
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     # Спочатку редагуємо повідомлення — миттєво для користувача
     await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
     # Потім пишемо в таблицю фоном
@@ -1192,8 +1490,7 @@ async def handle_assign_cancel(update, context):
     query = update.callback_query
     await safe_answer(query)
     await query.edit_message_text("❌ Скасовано.")
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     # Видаляємо через 30 сек
     schedule_delete(context, bot, query.message.chat_id, query.message.message_id, delay=30)
 
@@ -1220,18 +1517,15 @@ async def handle_assign_to(update, context):
 
     old = assign_store.get(feedback_id)
     if old:
-        from telegram import Bot
-        bot_notify = Bot(token=BOT_TOKEN)
-        try:
-            reassigned_msg = await bot_notify.send_message(
-                chat_id=old["assignee_id"],
-                text=f"❌ Завдання `{feedback_id}` передоручено іншому співробітнику.",
-                parse_mode="Markdown"
-            )
+        bot_notify = get_bot()
+        reassigned_msg = await safe_send_message(
+            bot_notify, old["assignee_id"],
+            f"❌ Завдання `{feedback_id}` передоручено іншому співробітнику.",
+            parse_mode="Markdown"
+        )
+        if reassigned_msg is not None:
             track_msg(old["assignee_id"], reassigned_msg.message_id)
             schedule_delete(context, bot_notify, old["assignee_id"], reassigned_msg.message_id, delay=AUTO_DELETE_DELAY)
-        except Exception:
-            pass
 
     assign_store[feedback_id] = {
         "assignee_id": target_uid,
@@ -1241,15 +1535,14 @@ async def handle_assign_to(update, context):
     }
     save_assign_store(assign_store)
 
-    assign_line = f"\n👤 Доручено: {target_name} — {assigner_name} {now}"
+    assign_line = f"\n👤 Доручено: {md(target_name)} — {md(assigner_name)} {now}"
     _, stored_text = get_msg_data(feedback_id)
     base_text = stored_text if stored_text else query.message.text
     lines = [l for l in base_text.split("\n") if not l.startswith("👤 Доручено:")]
     new_text = "\n".join(lines) + assign_line
     new_keyboard = build_task_keyboard(safe_id, assigned=True)
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
 
     # Беремо повний текст із msg_store (з коментарями), фільтруємо лише статуси і доручення
@@ -1259,31 +1552,22 @@ async def handle_assign_to(update, context):
     task_text = "\n".join(task_lines).strip()
 
     assignee_keyboard = build_task_keyboard(safe_id)
-    try:
-        msg = await bot.send_message(
-            chat_id=target_uid,
-            text=f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {assigner_name} {now}_",
-            parse_mode="Markdown",
-            reply_markup=assignee_keyboard
-        )
+    msg = await safe_send_message(
+        bot, target_uid,
+        f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {md(assigner_name)} {now}_",
+        reply_markup=assignee_keyboard, parse_mode="Markdown"
+    )
+    if msg is not None:
         track_msg(target_uid, msg.message_id)
         schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
-        if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict):
-            existing = msg_store[feedback_id]["ids"].get(str(target_uid))
-            if existing is None:
-                msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
-            elif isinstance(existing, list):
-                existing.append(msg.message_id)
-            else:
-                msg_store[feedback_id]["ids"][str(target_uid)] = [existing, msg.message_id]
+        if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict) and "ids" in msg_store[feedback_id]:
+            msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
         else:
-            msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text}
+            msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
         save_msg_store(msg_store)
-    except Exception as e:
-        logger.error(f"Assign send error: {e}")
 
     await update_sheet_history(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
-    await query.edit_message_text(f"✅ Завдання `{feedback_id}` доручено *{target_name}*", parse_mode="Markdown")
+    await query.edit_message_text(f"✅ Завдання `{feedback_id}` доручено *{md(target_name)}*", parse_mode="Markdown")
     # Видаляємо підтвердження через 60 сек
     schedule_delete(context, bot, query.message.chat_id, query.message.message_id, delay=60)
 
@@ -1333,8 +1617,7 @@ async def comment_clear_callback(context):
         user_data.pop('comment_safe_id', None)
         prompt_msg_id = user_data.pop('comment_prompt_msg_id', None)
         prompt_chat_id = user_data.pop('comment_prompt_chat_id', None)
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         if prompt_msg_id and prompt_chat_id:
             try:
                 await bot.edit_message_text(
@@ -1363,8 +1646,7 @@ async def handle_comment_cancel_mode(update, context):
     context.user_data.pop('comment_prompt_msg_id', None)
     context.user_data.pop('comment_prompt_chat_id', None)
     await query.edit_message_text("❌ Коментар скасовано.")
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     # Видаляємо через 30 сек
     schedule_delete(context, bot, query.message.chat_id, query.message.message_id, delay=30)
 
@@ -1385,7 +1667,8 @@ async def process_comment(update, context):
     who = get_display_name(profile)
     now = datetime.now().strftime("%d.%m %H:%M")
     comment_text = update.message.text.strip()
-    comment_line = f"💬 {who} {now}: {comment_text}"
+    comment_line_raw = f"💬 {who} {now}: {comment_text}"          # для таблиці (без екранування)
+    comment_line = f"💬 {md(who)} {now}: {md(comment_text)}"      # для показу в Telegram
 
     _, stored_text = get_msg_data(feedback_id)
     new_text = (stored_text + f"\n{comment_line}") if stored_text else comment_line
@@ -1393,10 +1676,9 @@ async def process_comment(update, context):
     assigned = feedback_id in assign_store
     keyboard = build_task_keyboard(safe_id or "", assigned=assigned)
 
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     await edit_all_messages(bot, feedback_id, new_text, keyboard)
-    await update_sheet_history(feedback_id, comment_line)
+    await update_sheet_history(feedback_id, comment_line_raw)
 
     # Редагуємо промпт замість нового повідомлення
     if prompt_msg_id and prompt_chat_id:
@@ -1425,10 +1707,34 @@ async def process_comment(update, context):
 
 # ─── ДАЙДЖЕСТ / ДНИ НАРОДЖЕННЯ ───────────────────────────────────────────────
 
+def _is_resolved(status):
+    """Задача вважається закритою лише якщо статус ПОЧИНАЄТЬСЯ з 'Виконано'/'Видалено'
+    (а не просто містить ці слова) — щоб коментар/ім'я не сховали відкриту задачу."""
+    st = str(status).strip()
+    return st.startswith("Виконано") or st.startswith("Видалено")
+
+
+def _store_task_message(fid, uid, message_id, text, photo=None, photo_path=""):
+    """Записує ОДИН актуальний message_id для (задача, отримувач) — без накопичення
+    застарілих id. Нормалізує legacy-записи."""
+    if fid == "—" or not fid:
+        return
+    entry = msg_store.get(fid)
+    if not (isinstance(entry, dict) and "ids" in entry):
+        entry = {"ids": (entry if isinstance(entry, dict) else {}), "text": text, "photo": photo, "photo_path": photo_path}
+    entry["ids"][str(uid)] = message_id      # перезапис, не додавання — старі вже видалені
+    entry["text"] = text
+    if photo is not None:
+        entry["photo"] = photo
+    if photo_path:
+        entry["photo_path"] = photo_path
+    msg_store[fid] = entry
+
+
 def build_row_text(row, fid, safe_id):
     """Формує текст і клавіатуру для рядка задачі з таблиці."""
-    status = row.get("Статус", "Нове")
-    status_icon = "🔴" if status == "Нове" else "🟡"
+    status = str(row.get("Статус", "Нове"))
+    status_icon = "🔴" if status.startswith("Нове") else "🟡"
     category = row.get("Категорія", "—")
     cat_icon = CATEGORY_ICONS.get(category, "📌")
     date = row.get("Дата", "—")
@@ -1436,22 +1742,24 @@ def build_row_text(row, fid, safe_id):
     sender = row.get("Хто повідомив", "—")
     summary = row.get("Суть", "—")
     history = row.get("Лог", "")
+    has_photo = str(row.get("Фото", "")).strip().startswith("є")
     date_str = f"{date} {time_val}".strip()
 
     assigned = fid in assign_store
     assign_info = assign_store.get(fid, {})
+    photo_mark = " 📷" if has_photo else ""
 
     text = (
-        f"{status_icon} `{fid}` · {cat_icon} *{category}*\n"
-        f"{summary}\n"
-        f"_{date_str} · {sender}_"
+        f"{status_icon} `{fid}` · {cat_icon} *{md(category)}*{photo_mark}\n"
+        f"{md(summary)}\n"
+        f"_{md(date_str)} · {md(sender)}_"
     )
     if assign_info:
-        text += f"\n👤 Доручено: {assign_info.get('assignee_name', '—')} — {assign_info.get('assigned_by', '—')} {assign_info.get('assigned_at', '')}"
+        text += f"\n👤 Доручено: {md(assign_info.get('assignee_name', '—'))} — {md(assign_info.get('assigned_by', '—'))} {assign_info.get('assigned_at', '')}"
     if history and history != "Нове":
-        entries = [e.strip() for e in history.split("|") if e.strip() and e.strip() != "Нове"]
+        entries = [e.strip() for e in str(history).split("|") if e.strip() and e.strip() != "Нове"]
         if entries:
-            text += "\n\n📋 _Історія:_\n" + "\n".join(f"_{e}_" for e in entries)
+            text += "\n\n📋 _Історія:_\n" + "\n".join(f"_{md(e)}_" for e in entries)
 
     keyboard = build_task_keyboard(safe_id, assigned=assigned)
     return text, keyboard
@@ -1463,25 +1771,22 @@ async def send_unresolved_digest(context):
     3. Повідомлення 2+: кожна невиконана задача окремо з кнопками
     """
     try:
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
-        gc = get_sheets_client()
-        sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Зворотний зв'язок")
-        rows = sheet.get_all_records()
+        bot = get_bot()
+        try:
+            rows = await _arun(lambda: _sheet_retry(_read_records))
+        except Exception as e:
+            logger.error(f"Digest: cannot read sheet, skipping run: {e}")
+            return
 
         recipients = list(get_recipients())
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
 
-        yesterday = (datetime.now() - __import__('datetime').timedelta(days=1)).strftime("%d.%m.%Y")
-        today_str = datetime.now().strftime("%d.%m.%Y")
-
-        unresolved = [
-            r for r in rows
-            if "Виконано" not in str(r.get("Статус", ""))
-            and "Видалено" not in str(r.get("Статус", ""))
-        ]
+        unresolved = [r for r in rows
+                      if str(r.get("Номер", "")).strip() and not _is_resolved(r.get("Статус", ""))]
         completed_yesterday = [
             r for r in rows
-            if "Виконано" in str(r.get("Статус", ""))
+            if str(r.get("Номер", "")).strip()
+            and str(r.get("Статус", "")).strip().startswith("Виконано")
             and r.get("Дата", "") == yesterday
         ]
 
@@ -1497,43 +1802,32 @@ async def send_unresolved_digest(context):
                 cat_icon = CATEGORY_ICONS.get(category, "📌")
                 summary = row.get("Суть", "—")
                 status = row.get("Статус", "—")
-                done_text += f"✅ `{fid}` · {cat_icon} {summary}\n_{status}_\n\n"
+                done_text += f"✅ `{fid}` · {cat_icon} {md(summary)}\n_{md(status)}_\n\n"
             for uid in recipients:
-                try:
-                    msg = await bot.send_message(chat_id=uid, text=done_text.strip(), parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
+                msg = await safe_send_message(bot, uid, done_text.strip(), reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+                if msg:
                     track_msg(uid, msg.message_id)
-                except Exception as e:
-                    logger.error(f"Digest done_yesterday error {uid}: {e}")
         else:
             for uid in recipients:
-                try:
-                    msg = await bot.send_message(
-                        chat_id=uid,
-                        text=f"✅ *Вчора ({yesterday}) виконаних завдань немає.*",
-                        parse_mode="Markdown",
-                        reply_markup=get_main_keyboard(uid)
-                    )
+                msg = await safe_send_message(bot, uid, f"✅ *Вчора ({yesterday}) виконаних завдань немає.*",
+                                              reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+                if msg:
                     track_msg(uid, msg.message_id)
-                except Exception as e:
-                    logger.error(f"Digest no_done error {uid}: {e}")
 
         # ── 3. Невиконані завдання ────────────────────────────────────────────
         if not unresolved:
             for uid in recipients:
-                try:
-                    msg = await bot.send_message(chat_id=uid, text="🎉 *Всі завдання виконано!*", parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
+                msg = await safe_send_message(bot, uid, "🎉 *Всі завдання виконано!*",
+                                              reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+                if msg:
                     track_msg(uid, msg.message_id)
-                except Exception:
-                    pass
             return
 
         header = f"🔴 *Невиконані завдання: {len(unresolved)}*"
         for uid in recipients:
-            try:
-                msg = await bot.send_message(chat_id=uid, text=header, parse_mode="Markdown")
+            msg = await safe_send_message(bot, uid, header, parse_mode="Markdown")
+            if msg:
                 track_msg(uid, msg.message_id)
-            except Exception:
-                pass
 
         for row in unresolved:
             fid = row.get("Номер", "—")
@@ -1541,25 +1835,22 @@ async def send_unresolved_digest(context):
             _, keyboard = build_row_text(row, fid, safe_id)
             raw = msg_store.get(fid)
             stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
+            stored_photo = raw.get("photo") if isinstance(raw, dict) else None
+            stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
             text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
             for uid in recipients:
-                try:
-                    msg = await bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=keyboard)
-                    # Трекаємо задачне повідомлення + таймер 24 год
-                    track_msg(uid, msg.message_id)
-                    schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
-                    if fid != "—":
-                        if fid not in msg_store or not isinstance(msg_store.get(fid), dict):
-                            msg_store[fid] = {"ids": {}, "text": text}
-                        existing = msg_store[fid]["ids"].get(str(uid))
-                        if existing is None:
-                            msg_store[fid]["ids"][str(uid)] = msg.message_id
-                        elif isinstance(existing, list):
-                            existing.append(msg.message_id)
-                        else:
-                            msg_store[fid]["ids"][str(uid)] = [existing, msg.message_id]
-                except Exception as e:
-                    logger.error(f"Digest item error {uid}: {e}")
+                msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
+                if msg is None:
+                    continue
+                track_msg(uid, msg.message_id)
+                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
+                if stored_photo:
+                    photo_msg = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
+                    if photo_msg is not None:
+                        track_msg(uid, photo_msg.message_id)
+                        schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
+                _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
+                await asyncio.sleep(0.03)  # делікатний темп, щоб не впертись у flood-control
             if fid != "—":
                 save_msg_store(msg_store)
 
@@ -1568,8 +1859,7 @@ async def send_unresolved_digest(context):
 
 async def send_birthday_greetings(context):
     try:
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         today = datetime.now().strftime("%d.%m")
         birthday_users = [(uid, p) for uid, p in user_profiles.items()
                           if p.get("status") == STATUS_ACTIVE and p.get("birthday", "")[:5] == today]
@@ -1622,8 +1912,7 @@ def refine_prompt_with_claude(current_prompt, instruction):
 async def process_prompt_voice(update, context):
     """Обробляє голосове повідомлення власника в режимі редагування промпту."""
     user_id = update.effective_user.id
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
 
     cancel_user_jobs(context, user_id, "promptedit")
 
@@ -1674,7 +1963,7 @@ async def process_prompt_voice(update, context):
 
     try:
         current = context.user_data.get('prompt_working', load_prompt())
-        new_prompt = refine_prompt_with_claude(current, instruction)
+        new_prompt = await _arun(lambda: refine_prompt_with_claude(current, instruction))
     except Exception as e:
         logger.error(f"Prompt refinement error: {e}")
         new_prompt = None
@@ -1735,8 +2024,7 @@ async def show_admin_menu(update, context):
         parse_mode="Markdown"
     )
     track_msg(msg.chat_id, msg.message_id)
-    from telegram import Bot as _Bot
-    _bot = _Bot(token=BOT_TOKEN)
+    _bot = get_bot()
     schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=MENU_DELETE_DELAY)
 
 async def handle_admin_menu(update, context):
@@ -1919,17 +2207,11 @@ async def handle_admin_menu(update, context):
 async def show_unresolved(query, context):
     """Показує невиконані завдання з повною клавіатурою і історією."""
     uid = query.from_user.id
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     try:
-        gc = get_sheets_client()
-        sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Зворотний зв'язок")
-        rows = sheet.get_all_records()
-        unresolved = [
-            r for r in rows
-            if "Виконано" not in str(r.get("Статус", ""))
-            and "Видалено" not in str(r.get("Статус", ""))
-        ]
+        rows = await _arun(lambda: _sheet_retry(_read_records))
+        unresolved = [r for r in rows
+                      if str(r.get("Номер", "")).strip() and not _is_resolved(r.get("Статус", ""))]
 
         if not unresolved:
             await query.edit_message_text(
@@ -1941,8 +2223,10 @@ async def show_unresolved(query, context):
         # Очищуємо чат перед показом актуального списку задач
         await delete_tracked_messages(bot, [uid])
 
-        header = await bot.send_message(chat_id=uid, text=f"🔴 *Невиконані завдання: {len(unresolved)}*", parse_mode="Markdown", reply_markup=get_main_keyboard(uid))
-        track_msg(uid, header.message_id)
+        header = await safe_send_message(bot, uid, f"🔴 *Невиконані завдання: {len(unresolved)}*",
+                                         reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+        if header:
+            track_msg(uid, header.message_id)
 
         for row in unresolved:
             fid = row.get("Номер", "—")
@@ -1950,24 +2234,23 @@ async def show_unresolved(query, context):
             _, keyboard = build_row_text(row, fid, safe_id)
             raw = msg_store.get(fid)
             stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
+            stored_photo = raw.get("photo") if isinstance(raw, dict) else None
+            stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
             text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
-            try:
-                msg = await bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=keyboard)
-                track_msg(uid, msg.message_id)
-                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
-                if fid != "—":
-                    if fid not in msg_store or not isinstance(msg_store.get(fid), dict):
-                        msg_store[fid] = {"ids": {}, "text": text}
-                    existing = msg_store[fid]["ids"].get(str(uid))
-                    if existing is None:
-                        msg_store[fid]["ids"][str(uid)] = msg.message_id
-                    elif isinstance(existing, list):
-                        existing.append(msg.message_id)
-                    else:
-                        msg_store[fid]["ids"][str(uid)] = [existing, msg.message_id]
-                    save_msg_store(msg_store)
-            except Exception as e:
-                logger.error(f"Unresolved item send error: {e}")
+            msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
+            if msg is None:
+                continue
+            track_msg(uid, msg.message_id)
+            schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
+            if stored_photo:
+                photo_msg = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
+                if photo_msg is not None:
+                    track_msg(uid, photo_msg.message_id)
+                    schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
+            _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
+            if fid != "—":
+                save_msg_store(msg_store)
+            await asyncio.sleep(0.03)
 
     except Exception as e:
         logger.error(f"Show unresolved error: {e}")
@@ -1991,8 +2274,7 @@ async def handle_restore(update, context):
         save_profiles(user_profiles)
         full_name = get_display_name(user_profiles[user_id])
         await query.edit_message_text(f"✅ {full_name} — відновлено!")
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             await bot.send_message(chat_id=user_id, text="✅ Ваш доступ до бота відновлено! Ласкаво просимо назад 🎉", reply_markup=get_main_keyboard(user_id))
         except Exception as e:
@@ -2001,6 +2283,9 @@ async def handle_restore(update, context):
 async def handle_admin_role_select(update, context):
     query = update.callback_query
     await safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
     target_uid = int(query.data.replace("adminrole_", ""))
     keyboard = [[InlineKeyboardButton(role, callback_data=f"adminsetrole_{target_uid}_{role}")] for role in ROLES]
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_changerole")])
@@ -2014,16 +2299,23 @@ async def handle_admin_role_select(update, context):
 async def handle_admin_set_role(update, context):
     query = update.callback_query
     await safe_answer(query)
+    actor_id = update.effective_user.id
+    if not is_admin(actor_id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
     parts = query.data.replace("adminsetrole_", "").split("_", 1)
     target_uid = int(parts[0])
     new_role = parts[1]
+    # лише власник може призначати керівні ролі (захист від самопідвищення)
+    if new_role in ADMIN_ROLES and not is_owner(actor_id):
+        await safe_answer(query, "Лише власник може призначати керівні ролі.", show_alert=True)
+        return
     if target_uid in user_profiles:
         user_profiles[target_uid]["role"] = new_role
         save_profiles(user_profiles)
         full_name = get_display_name(user_profiles[target_uid])
         await query.edit_message_text(f"✅ Роль *{full_name}* змінено на *{new_role}*", parse_mode="Markdown")
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             await bot.send_message(chat_id=target_uid, text=f"✅ Вашу роль змінено на *{new_role}*", parse_mode="Markdown")
         except Exception as e:
@@ -2041,8 +2333,7 @@ async def handle_fire(update, context):
         save_profiles(user_profiles)
         full_name = get_display_name(user_profiles[user_id])
         await query.edit_message_text(f"✅ {full_name} — звільнено.")
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             await bot.send_message(chat_id=user_id, text="❌ Ваш доступ до бота відхилено керівником.")
         except Exception as e:
@@ -2083,8 +2374,7 @@ async def handle_new_role(update, context):
     new_role = query.data.replace("newrole_", "")
     profile = user_profiles.get(user_id, {})
     full_name = get_display_name(profile)
-    from telegram import Bot
-    bot = Bot(token=BOT_TOKEN)
+    bot = get_bot()
     text = (f"🔄 *Заявка на зміну ролі*\n\n👤 {full_name}\n"
             f"📌 Поточна: {profile.get('role', '—')}\n➡️ Нова: {new_role}\n🏠 {profile.get('restaurant', '—')}")
     keyboard = InlineKeyboardMarkup([[
@@ -2113,8 +2403,7 @@ async def handle_confirm_role(update, context):
         save_profiles(user_profiles)
         full_name = get_display_name(user_profiles[user_id])
         await query.edit_message_text(f"✅ Роль {full_name} змінено на *{new_role}*", parse_mode="Markdown")
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             await bot.send_message(chat_id=user_id, text=f"✅ Вашу роль змінено на *{new_role}*", parse_mode="Markdown")
         except Exception as e:
@@ -2130,8 +2419,7 @@ async def handle_reject_role(update, context):
     if user_id in user_profiles:
         full_name = get_display_name(user_profiles[user_id])
         await query.edit_message_text(f"❌ Заявку {full_name} відхилено.")
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
+        bot = get_bot()
         try:
             await bot.send_message(chat_id=user_id, text="❌ Вашу заявку на зміну ролі відхилено.")
         except Exception as e:
@@ -2189,9 +2477,75 @@ async def cmd_fire(update, context):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
+_last_error_notify = 0.0
+
+async def error_handler(update, context):
+    """Глобальний обробник — жодна помилка більше не зникає тихо."""
+    global _last_error_notify
+    logger.error("Unhandled exception while handling update", exc_info=context.error)
+    try:
+        now = time.time()
+        if OWNER_IDS and (now - _last_error_notify) > 60:   # не частіше разу на хвилину
+            _last_error_notify = now
+            err = str(context.error)[:300]
+            await safe_send_message(get_bot(), OWNER_IDS[0], f"⚠️ Помилка бота:\n{err}", parse_mode=None)
+    except Exception:
+        pass
+
+
+async def _post_init(app):
+    """Після завантаження persistence: прибрати тимчасовий стан, щоб старе фото/опис
+    не причепились до нового повідомлення після перезапуску бота."""
+    transient = ('pending_photo', 'pending_message', 'message_type', 'waiting_for_option',
+                 'waiting_for_photo', 'option_message_id', 'option_chat_id', 'is_anonymous',
+                 'sender_name', 'sender_role', 'commenting_on', 'comment_safe_id',
+                 'comment_prompt_msg_id', 'comment_prompt_chat_id',
+                 'prompt_editing', 'prompt_working', 'prompt_original', 'prompt_msg_id', 'prompt_chat_id')
+    try:
+        for ud in app.user_data.values():
+            for k in transient:
+                ud.pop(k, None)
+        logger.info("post_init: transient user_data cleared")
+    except Exception as e:
+        logger.error(f"post_init cleanup error: {e}")
+
+
 def main():
+    global application
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Persistence: pending_photo / pending_message переживають перезапуск бота
+    pkl_path = os.path.join(os.path.dirname(__file__), "bot_state.pkl")
+    if os.path.exists(pkl_path):
+        valid = False
+        try:
+            import pickle
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+            # PTB-сумісність: має бути dict із ключами, які читає PicklePersistence
+            valid = isinstance(data, dict) and {"user_data", "chat_data", "conversations"} <= set(data.keys())
+        except Exception as e:
+            logger.error(f"bot_state.pkl unreadable: {e}")
+        if not valid:
+            logger.error("bot_state.pkl invalid/incompatible — removing to avoid crash-loop")
+            try:
+                os.remove(pkl_path)
+            except Exception:
+                pass
+
+    # Прибираємо осиротілі LOCAL-задачі (створені під час недоступності таблиці) —
+    # вони не реконсиляться з таблицею, тож не накопичуємо їх між перезапусками.
+    _local = [k for k in list(msg_store.keys()) if str(k).startswith("LOCAL-")]
+    if _local:
+        for k in _local:
+            msg_store.pop(k, None)
+        save_msg_store(msg_store)
+        logger.info(f"Pruned {len(_local)} orphaned LOCAL- task(s) from msg_store")
+
+    persistence = PicklePersistence(filepath=pkl_path)
+    app = (Application.builder().token(BOT_TOKEN)
+           .persistence(persistence).post_init(_post_init).build())
+    application = app   # щоб get_bot() використовував єдиний керований bot
 
     job_queue = app.job_queue
     job_queue.run_daily(send_unresolved_digest, time=datetime.strptime("06:00", "%H:%M").time())
@@ -2237,6 +2591,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_set_role, pattern="^adminsetrole_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
     app.add_handler(MessageHandler(filters.VOICE, receive_voice))
+
+    app.add_error_handler(error_handler)
 
     logger.info("Бот запущено...")
     app.run_polling()

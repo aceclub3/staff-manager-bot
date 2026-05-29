@@ -9,3 +9,10 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# runtime state / local artifacts
+bot_state.pkl
+*.bak
+*.backup_*
+logs/
+bot_log.txt
