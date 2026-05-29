@@ -30,8 +30,14 @@ from telegram.error import BadRequest, RetryAfter, Forbidden, TimedOut, NetworkE
 from telegram.ext import PicklePersistence
 from telegram.helpers import escape_markdown
 
+import storage  # єдина локальна база SQLite (feedback.db)
+
 logging.basicConfig(stream=sys.stdout, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Ініціалізуємо БД і одноразово мігруємо старі JSON-стори (якщо таблиці порожні).
+storage.init()
+storage.migrate_kv_if_empty(os.path.dirname(__file__))
 
 
 def md(s):
@@ -62,7 +68,8 @@ AUTO_DELETE_DELAY = 30     # секунд — звичайні повідомл�
 MENU_DELETE_DELAY = 120    # секунд — меню з кнопками
 TASK_DELETE_DELAY = 86400  # секунд (24 год) — задачні повідомлення
 
-GDRIVE_PHOTOS_PATH = r"G:\Мой диск\BOTS\Feedback\Фото"
+PHOTO_PRIMARY_PATH = r"E:\Denys\Feedback\Фото"          # основне локальне сховище фото
+PHOTO_MIRROR_PATH = r"G:\Мой диск\BOTS\Feedback\Фото"   # копія для перегляду в Google Drive
 
 ASK_FIRST_NAME, ASK_LAST_NAME, ASK_BIRTHDAY, ASK_PHONE, ASK_ROLE, ASK_RESTAURANT = range(6)
 
@@ -115,10 +122,11 @@ def _safe_load_json(path, default):
     return default() if callable(default) else default
 
 
-PROFILES_FILE = os.path.join(os.path.dirname(__file__), "user_profiles.json")
+# Профілі, msg_store, assign_store — тепер у SQLite (storage). In-memory кеші
+# завантажуються при старті й пишуться наскрізь (write-through).
 
 def load_profiles():
-    data = _safe_load_json(PROFILES_FILE, {})
+    data = storage.load_kv("profiles")
     try:
         return {int(k): v for k, v in data.items()}
     except Exception as e:
@@ -126,43 +134,40 @@ def load_profiles():
         return {}
 
 def save_profiles(profiles):
-    _atomic_write_json(PROFILES_FILE, {str(k): v for k, v in profiles.items()})
+    storage.save_kv("profiles", profiles)
 
 user_profiles = load_profiles()
 
-# Хранилище message_id для редактирования уведомлений
-MSG_STORE_FILE = os.path.join(os.path.dirname(__file__), "message_store.json")
-
+# Кеш message_id для редагування сповіщень (у SQLite таблиця msgstore)
 def load_msg_store():
-    data = _safe_load_json(MSG_STORE_FILE, {})
-    if not isinstance(data, dict):
-        return {}
-    # Одноразова міграція legacy-записів {uid: msg_id} -> {"ids":..., "text":"", "photo":None}
+    data = storage.load_kv("msgstore")
+    # Одноразова нормалізація legacy-записів {uid: msg_id} -> {"ids":..., "text":"", "photo":None}
     changed = False
     for k, v in list(data.items()):
         if isinstance(v, dict) and "ids" not in v:
             data[k] = {"ids": v, "text": "", "photo": None}
             changed = True
     if changed:
-        _atomic_write_json(MSG_STORE_FILE, data)
+        storage.save_kv("msgstore", data)
     return data
 
 def save_msg_store(store):
-    _atomic_write_json(MSG_STORE_FILE, store)
+    storage.save_kv("msgstore", store)
 
 msg_store = load_msg_store()
 
-# Хранилище назначений (доручити)
-ASSIGN_STORE_FILE = os.path.join(os.path.dirname(__file__), "assign_store.json")
-
+# Доручення (таблиця assign)
 def load_assign_store():
-    data = _safe_load_json(ASSIGN_STORE_FILE, {})
-    return data if isinstance(data, dict) else {}
+    return storage.load_kv("assign")
 
 def save_assign_store(store):
-    _atomic_write_json(ASSIGN_STORE_FILE, store)
+    storage.save_kv("assign", store)
 
 assign_store = load_assign_store()
+
+# Канонічні задачі (джерело правди для дайджесту/переліку). Завантажуються тут,
+# а одноразова міграція з Google Sheet (якщо БД порожня) — у _post_init.
+tasks_store = storage.load_tasks()
 
 # ─── ПРОМПТ ───────────────────────────────────────────────────────────────────
 
@@ -215,36 +220,26 @@ def save_prompt(template):
 
 # ─── ТРЕКІНГ ПОВІДОМЛЕНЬ (для очищення перед дайджестом) ─────────────────────
 
-CHAT_MSGS_FILE = os.path.join(os.path.dirname(__file__), "chat_msgs.json")
-
+# Трекінг повідомлень (таблиця chat) — для очищення чату перед дайджестом/переліком
 def load_chat_msgs():
-    data = _safe_load_json(CHAT_MSGS_FILE, {})
-    return data if isinstance(data, dict) else {}
+    return storage.load_kv("chat")
 
 def save_chat_msgs_data(data):
-    # Некритичні дані (очищаються щодайджест) і пишуться дуже часто (track_msg) —
-    # тому без fsync/копії .bak: швидкий tmp+replace, щоб не блокувати event loop.
-    try:
-        tmp = CHAT_MSGS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, CHAT_MSGS_FILE)
-    except Exception as e:
-        logger.error(f"chat_msgs save error: {e}")
+    storage.save_kv("chat", data)
 
 chat_msgs_store = load_chat_msgs()
 
 def track_msg(chat_id, message_id):
-    """Відстежує не-задачне повідомлення бота для очищення перед дайджестом."""
+    """Відстежує повідомлення бота для очищення перед дайджестом (per-key запис у БД)."""
     key = str(chat_id)
     if key not in chat_msgs_store:
         chat_msgs_store[key] = []
     if message_id not in chat_msgs_store[key]:
         chat_msgs_store[key].append(message_id)
-    save_chat_msgs_data(chat_msgs_store)
+    storage.kv_put("chat", key, chat_msgs_store[key])
 
 async def delete_tracked_messages(bot, chat_ids):
-    """Видаляє всі відстежені (не-задачні) повідомлення бота перед дайджестом."""
+    """Видаляє всі відстежені повідомлення бота перед дайджестом/переліком."""
     for chat_id in chat_ids:
         key = str(chat_id)
         for mid in list(chat_msgs_store.get(key, [])):
@@ -253,7 +248,7 @@ async def delete_tracked_messages(bot, chat_ids):
             except Exception:
                 pass
         chat_msgs_store[key] = []
-    save_chat_msgs_data(chat_msgs_store)
+        storage.kv_put("chat", key, [])
 
 
 def build_task_keyboard(safe_id, assigned=False, done=False):
@@ -971,21 +966,29 @@ async def photo_waiting_clear_callback(context):
 
 
 async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
-    """Скачивает фото из Telegram и сохраняет в папку с датой. Повертає шлях або ''."""
+    """Завантажує фото з Telegram на основне локальне сховище (E:) і дублює копію
+    на Google Drive (G:). Повертає шлях основного файлу (для резерву) або ''."""
+    primary_path = ""
     try:
         bot = get_bot()
         tg_file = await bot.get_file(file_id)
-
-        today_folder = os.path.join(GDRIVE_PHOTOS_PATH, datetime.now().strftime("%Y-%m-%d"))
-        os.makedirs(today_folder, exist_ok=True)
-        dest_path = os.path.join(today_folder, filename)
-        await tg_file.download_to_drive(dest_path)
-
-        logger.info(f"Photo saved to: {dest_path}")
-        return dest_path
+        today = datetime.now().strftime("%Y-%m-%d")
+        primary_dir = os.path.join(PHOTO_PRIMARY_PATH, today)
+        os.makedirs(primary_dir, exist_ok=True)
+        primary_path = os.path.join(primary_dir, filename)
+        await tg_file.download_to_drive(primary_path)
+        logger.info(f"Photo saved (primary): {primary_path}")
     except Exception as e:
-        logger.error(f"Photo save error: {e}")
+        logger.error(f"Photo primary save error: {e}")
         return ""
+    # Дзеркало на G: (необов'язкове — якщо диск не змонтований, просто лог)
+    try:
+        mirror_dir = os.path.join(PHOTO_MIRROR_PATH, datetime.now().strftime("%Y-%m-%d"))
+        os.makedirs(mirror_dir, exist_ok=True)
+        shutil.copy2(primary_path, os.path.join(mirror_dir, filename))
+    except Exception as e:
+        logger.error(f"Photo mirror to G: failed: {e}")
+    return primary_path
 
 
 async def _save_and_notify(results, user_data, profile, photo_file_id, context):
@@ -998,7 +1001,7 @@ async def _save_and_notify(results, user_data, profile, photo_file_id, context):
         gdrive_path = await save_photo_to_gdrive(photo_file_id, filename)
     categories, ids = [], []
     for i, result in enumerate(results):
-        feedback_id = await save_to_sheets(result, user_data, profile, has_photos=bool(photo_file_id))
+        feedback_id = create_task(result, user_data, profile, has_photos=bool(photo_file_id))
         await send_notifications(result, user_data, profile,
                                  photo_file_id=photo_file_id, feedback_id=feedback_id, context=context,
                                  photo_path=gdrive_path, send_live_photo=(i == 0))
@@ -1225,50 +1228,101 @@ def get_restaurant_prefix(restaurant):
     prefixes = {"Терраса": "T", "Хочу": "H", "Хочу 2.0": "H2"}
     return prefixes.get(restaurant, "X")
 
-def generate_feedback_id(sheet, restaurant):
-    """Генерирует ID вида T-0104-1, T-0104-2..."""
+def generate_feedback_id(restaurant):
+    """Генерує ID виду T-0104-1, рахуючи задачі цього закладу за сьогодні в БД."""
     prefix = get_restaurant_prefix(restaurant)
     today = datetime.now().strftime("%d%m")
     id_prefix = f"{prefix}-{today}-"
-    try:
-        all_ids = sheet.col_values(1)
-        today_ids = [v for v in all_ids if v.startswith(id_prefix)]
-        next_num = len(today_ids) + 1
-    except Exception:
-        next_num = 1
+    next_num = sum(1 for k in tasks_store if str(k).startswith(id_prefix)) + 1
     return f"{id_prefix}{next_num}"
 
-async def save_to_sheets(result, user_data, profile, has_photos=False):
-    detected_restaurant = result.get("restaurant", "Терраса")
+def _task_record(rec):
+    """Перетворює нативний запис задачі на dict з укр. ключами (для build_row_text/дайджесту)."""
+    return {
+        "Номер": rec.get("fid", ""), "Дата": rec.get("created_date", ""), "Час": rec.get("created_time", ""),
+        "Заклад": rec.get("restaurant", ""), "Хто повідомив": rec.get("sender_name", "—"),
+        "Роль": rec.get("sender_role", "—"), "Категорія": rec.get("category", "—"),
+        "Суть": rec.get("summary", "—"), "Відповідальний": rec.get("responsible", "—"),
+        "Терміновість": rec.get("urgency", "—"),
+        "Фото": "є фото" if rec.get("has_photo") else "—",
+        "Статус": rec.get("status", "Нове"), "Лог": rec.get("log", "") or "",
+    }
 
+def create_task(result, user_data, profile, has_photos=False):
+    """СТВОРЮЄ задачу в SQLite (джерело правди) і дзеркалить у Google Sheets (фоном)."""
+    restaurant = result.get("restaurant", "Терраса")
+    fid = generate_feedback_id(restaurant)
+    now = datetime.now()
+    rec = {
+        "fid": fid,
+        "created_date": now.strftime("%d.%m.%Y"), "created_time": now.strftime("%H:%M"),
+        "restaurant": restaurant,
+        "sender_name": user_data.get("sender_name", "—"),
+        "sender_role": user_data.get("sender_role", "—"),
+        "category": result.get("category", "—"),
+        "summary": result.get("summary", "—"),
+        "responsible": result.get("responsible", "—"),
+        "urgency": result.get("urgency", "—"),
+        "has_photo": bool(has_photos),
+        "status": "Нове", "log": "",
+        "seq": storage.next_seq(),
+    }
+    tasks_store[fid] = rec
+    storage.save_task(rec)
+    asyncio.create_task(_mirror_create_to_sheet(rec))
+    logger.info(f"Task created {fid}: {rec['category']} / {rec['urgency']}")
+    return fid
+
+def set_task_status(feedback_id, status):
+    """Оновлює статус задачі в SQLite (джерело правди) + дзеркало в Sheets (фоном)."""
+    rec = tasks_store.get(feedback_id)
+    if rec:
+        rec["status"] = status
+        storage.save_task(rec)
+    asyncio.create_task(_mirror_status_to_sheet(feedback_id, status))
+
+def add_task_log(feedback_id, entry):
+    """Додає запис у Лог задачі в SQLite + дзеркало в Sheets (фоном)."""
+    rec = tasks_store.get(feedback_id)
+    if rec:
+        cur = rec.get("log", "")
+        rec["log"] = (cur + " | " + entry).strip(" | ")
+        storage.save_task(rec)
+    asyncio.create_task(_mirror_log_to_sheet(feedback_id, entry))
+
+# ─── ДЗЕРКАЛО В GOOGLE SHEETS (best-effort, не впливає на джерело правди) ──────
+
+async def _mirror_create_to_sheet(rec):
     def _do():
         ws = get_worksheet()
-        feedback_id = generate_feedback_id(ws, detected_restaurant)
-        now = datetime.now()
-        row = [
-            feedback_id,
-            now.strftime("%d.%m.%Y"), now.strftime("%H:%M"),
-            detected_restaurant, user_data.get("sender_name", "—"), user_data.get("sender_role", "—"),
-            result.get("category", "—"), result.get("summary", "—"),
-            result.get("responsible", "—"), result.get("urgency", "—"),
-            "є фото" if has_photos else "—", "Нове", "Нове"
-        ]
-        ws.insert_row(row, index=2)
-        return feedback_id
-
+        ws.insert_row([
+            rec["fid"], rec["created_date"], rec["created_time"], rec["restaurant"],
+            rec["sender_name"], rec["sender_role"], rec["category"], rec["summary"],
+            rec["responsible"], rec["urgency"],
+            "є фото" if rec.get("has_photo") else "—", rec.get("status", "Нове"),
+            rec.get("log", "") or "Нове",
+        ], index=2)
     try:
-        feedback_id = await _arun(lambda: _sheet_retry(_do))
-        logger.info(f"Saved to Sheets ID {feedback_id}: {result.get('category')} / {result.get('urgency')}")
-        return feedback_id
+        await _arun(lambda: _sheet_retry(_do))
     except Exception as e:
-        # Таблиця недоступна навіть після повторів — даємо локальний id,
-        # щоб задача лишалась керованою в Telegram (кнопки/коментарі працюють).
-        local_id = "LOCAL-" + uuid.uuid4().hex[:6].upper()
-        logger.error(f"Sheets save failed, using local id {local_id}: {e}")
-        return local_id
+        logger.error(f"Sheet mirror (create) failed {rec.get('fid')}: {e}")
 
-async def update_sheet_history(feedback_id, entry):
-    """Додає запис в колонку Лог (col 13)."""
+async def _mirror_status_to_sheet(feedback_id, status):
+    if not feedback_id or str(feedback_id).startswith("LOCAL-"):
+        return
+    def _do():
+        ws = get_worksheet()
+        all_ids = ws.col_values(1)
+        for i, val in enumerate(all_ids):
+            if val == feedback_id:
+                ws.update_cell(i + 1, 12, status)
+                return
+    try:
+        await _arun(lambda: _sheet_retry(_do))
+    except Exception as e:
+        logger.error(f"Sheet mirror (status) failed {feedback_id}: {e}")
+
+async def _mirror_log_to_sheet(feedback_id, entry):
     if not feedback_id or str(feedback_id).startswith("LOCAL-"):
         return
     def _do():
@@ -1277,34 +1331,12 @@ async def update_sheet_history(feedback_id, entry):
         for i, val in enumerate(all_ids):
             if val == feedback_id:
                 current = ws.cell(i + 1, 13).value or ""
-                new_history = (current + " | " + entry).strip(" | ")
-                ws.update_cell(i + 1, 13, new_history)
+                ws.update_cell(i + 1, 13, (current + " | " + entry).strip(" | "))
                 return
     try:
         await _arun(lambda: _sheet_retry(_do))
     except Exception as e:
-        logger.error(f"History update error: {e}")
-
-async def update_sheet_status(feedback_id, status, who):
-    """Оновлює статус рядка в Google Sheets за ID."""
-    if not feedback_id or str(feedback_id).startswith("LOCAL-"):
-        return
-    def _do():
-        ws = get_worksheet()
-        all_ids = ws.col_values(1)
-        for i, val in enumerate(all_ids):
-            if val == feedback_id:
-                ws.update_cell(i + 1, 12, f"{status}" + (f" — {who}" if who else ""))
-                return True
-        return False
-    try:
-        found = await _arun(lambda: _sheet_retry(_do))
-        if found:
-            logger.info(f"Status updated ID {feedback_id}: {status}")
-        else:
-            logger.warning(f"ID {feedback_id} not found in sheet")
-    except Exception as e:
-        logger.error(f"Sheet status update error: {e}")
+        logger.error(f"Sheet mirror (log) failed {feedback_id}: {e}")
 
 async def send_notifications(result, user_data, profile, photo_file_id=None, feedback_id=None,
                              context=None, photo_path="", send_live_photo=True):
@@ -1416,8 +1448,8 @@ async def handle_status_update(update, context):
         if feedback_id in assign_store:
             assign_store.pop(feedback_id, None)
             save_assign_store(assign_store)
-        asyncio.create_task(update_sheet_status(feedback_id, "Видалено", who))
-        asyncio.create_task(update_sheet_history(feedback_id, f"🗑️ Видалено — {who} {now}"))
+        set_task_status(feedback_id, f"Видалено — {who}")
+        add_task_log(feedback_id, f"🗑️ Видалено — {who} {now}")
         return
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1452,9 +1484,9 @@ async def handle_status_update(update, context):
     bot = get_bot()
     # Спочатку редагуємо повідомлення — миттєво для користувача
     await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
-    # Потім пишемо в таблицю фоном
-    asyncio.create_task(update_sheet_status(feedback_id, sheet_status, ""))
-    asyncio.create_task(update_sheet_history(feedback_id, history_entry))
+    # Оновлюємо задачу в SQLite (джерело правди) + дзеркало в Sheets (фоном)
+    set_task_status(feedback_id, sheet_status)
+    add_task_log(feedback_id, history_entry)
 
 
 # ─── ДОРУЧЕННЯ (ASSIGN) ───────────────────────────────────────────────────────
@@ -1566,7 +1598,7 @@ async def handle_assign_to(update, context):
             msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
         save_msg_store(msg_store)
 
-    await update_sheet_history(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
+    add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
     await query.edit_message_text(f"✅ Завдання `{feedback_id}` доручено *{md(target_name)}*", parse_mode="Markdown")
     # Видаляємо підтвердження через 60 сек
     schedule_delete(context, bot, query.message.chat_id, query.message.message_id, delay=60)
@@ -1678,7 +1710,7 @@ async def process_comment(update, context):
 
     bot = get_bot()
     await edit_all_messages(bot, feedback_id, new_text, keyboard)
-    await update_sheet_history(feedback_id, comment_line_raw)
+    add_task_log(feedback_id, comment_line_raw)
 
     # Редагуємо промпт замість нового повідомлення
     if prompt_msg_id and prompt_chat_id:
@@ -1772,11 +1804,9 @@ async def send_unresolved_digest(context):
     """
     try:
         bot = get_bot()
-        try:
-            rows = await _arun(lambda: _sheet_retry(_read_records))
-        except Exception as e:
-            logger.error(f"Digest: cannot read sheet, skipping run: {e}")
-            return
+        # Джерело правди — SQLite (tasks_store). Найновіші згори (за seq).
+        rows = [_task_record(r) for _, r in
+                sorted(tasks_store.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)]
 
         recipients = list(get_recipients())
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
@@ -2209,7 +2239,8 @@ async def show_unresolved(query, context):
     uid = query.from_user.id
     bot = get_bot()
     try:
-        rows = await _arun(lambda: _sheet_retry(_read_records))
+        rows = [_task_record(r) for _, r in
+                sorted(tasks_store.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)]
         unresolved = [r for r in rows
                       if str(r.get("Номер", "")).strip() and not _is_resolved(r.get("Статус", ""))]
 
@@ -2508,6 +2539,37 @@ async def _post_init(app):
         logger.info("post_init: transient user_data cleared")
     except Exception as e:
         logger.error(f"post_init cleanup error: {e}")
+
+    # Одноразова міграція задач із Google Sheet у SQLite (якщо БД задач порожня)
+    global tasks_store
+    try:
+        if storage.tasks_count() == 0:
+            recs = await _arun(lambda: _sheet_retry(_read_records))
+            migrated, seq = [], 0
+            for r in reversed(recs):  # лист новіші згори -> старим даємо менший seq
+                fid = str(r.get("Номер", "")).strip()
+                if not fid:
+                    continue
+                seq += 1
+                migrated.append({
+                    "fid": fid, "created_date": r.get("Дата", ""), "created_time": r.get("Час", ""),
+                    "restaurant": r.get("Заклад", ""), "sender_name": r.get("Хто повідомив", "—"),
+                    "sender_role": r.get("Роль", "—"), "category": r.get("Категорія", "—"),
+                    "summary": r.get("Суть", "—"), "responsible": r.get("Відповідальний", "—"),
+                    "urgency": r.get("Терміновість", "—"),
+                    "has_photo": str(r.get("Фото", "")).strip().startswith("є"),
+                    "status": (r.get("Статус", "Нове") or "Нове"), "log": r.get("Лог", ""), "seq": seq,
+                })
+            storage.bulk_save_tasks(migrated)
+            logger.info(f"post_init: migrated {len(migrated)} tasks from Sheet into SQLite")
+    except Exception as e:
+        logger.error(f"post_init task migration error: {e}")
+    # Перезавантажуємо кеш задач із БД (після можливої міграції)
+    try:
+        tasks_store = storage.load_tasks()
+        logger.info(f"post_init: tasks_store loaded ({len(tasks_store)})")
+    except Exception as e:
+        logger.error(f"post_init tasks load error: {e}")
 
 
 def main():

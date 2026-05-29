@@ -16,3 +16,8 @@ bot_state.pkl
 *.backup_*
 logs/
 bot_log.txt
+
+# SQLite database (local source of truth)
+*.db
+*.db-wal
+*.db-shm
