@@ -394,7 +394,7 @@ def _read_records():
 def get_main_keyboard(user_id):
     """Возвращает Reply-клавиатуру в зависимости от роли."""
     buttons = [[KeyboardButton("💬 Надіслати повідомлення")]]
-    if is_admin(user_id):
+    if can_manage_tasks(user_id):
         buttons.append([KeyboardButton("👨‍💼 Адмін-меню")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -700,7 +700,7 @@ async def receive_text(update, context):
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
 
     if text == "👨‍💼 Адмін-меню":
-        if is_admin(user_id):
+        if can_manage_tasks(user_id):
             await show_admin_menu(update, context)
         else:
             msg = await update.message.reply_text("❌ Немає прав.")
@@ -1061,8 +1061,10 @@ async def process_message(query_or_update, context, profile, use_message=False):
         context.user_data.pop(key, None)
 
     confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
-    _uid = profile.get('telegram_id')
-    sent = await target.reply_text(confirm_text, reply_markup=get_main_keyboard(_uid) if _uid else None)
+    # БЕЗ reply_markup: це підтвердження автовидаляється (нижче). Reply-клавіатура
+    # «прив'язана» до останнього повідомлення-носія, тож видалення носія прибрало б
+    # постійні кнопки (зокрема «Адмін-меню»). Клавіатура й так живе на /start і в дайджесті.
+    sent = await target.reply_text(confirm_text)
     # Видаляємо підтвердження через 90 сек
     schedule_delete(context, get_bot(), sent.chat_id, sent.message_id, delay=90)
 
@@ -1094,7 +1096,8 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
         user_data.pop(key, None)
 
     confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
-    sent = await safe_send_message(bot, chat_id, confirm_text, reply_markup=get_main_keyboard(user_id), parse_mode=None)
+    # БЕЗ reply_markup — див. коментар у process(): носій reply-клавіатури не можна автовидаляти.
+    sent = await safe_send_message(bot, chat_id, confirm_text, parse_mode=None)
     if context and sent:
         # Видаляємо підтвердження через 90 сек
         schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
@@ -2032,25 +2035,34 @@ async def process_prompt_voice(update, context):
 
 # ─── АДМІН-МЕНЮ ──────────────────────────────────────────────────────────────
 
+def build_admin_menu_keyboard(user_id):
+    """Меню залежно від ролі. «Адміністратор» (can_manage_tasks, але НЕ is_admin) —
+    лише «Невиконані завдання»; повні адміни (Управляючий/Виконавчий директор/власник) —
+    увесь набір; власник — додатково керування промптом."""
+    keyboard = [[InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")]]
+    if is_admin(user_id):
+        keyboard += [
+            [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
+            [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
+            [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
+            [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
+            [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
+        ]
+    if is_owner(user_id):
+        keyboard += [
+            [InlineKeyboardButton("📋 Поточний промпт", callback_data="menu_view_prompt")],
+            [InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")],
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
 async def show_admin_menu(update, context):
     user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not can_manage_tasks(user_id):
         await update.message.reply_text("❌ Немає прав.")
         return
-    keyboard = [
-        [InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
-        [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
-        [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
-        [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
-        [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
-        [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
-    ]
-    if is_owner(user_id):
-        keyboard.append([InlineKeyboardButton("📋 Поточний промпт", callback_data="menu_view_prompt")])
-        keyboard.append([InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")])
     msg = await update.message.reply_text(
         "👨‍💼 *Адмін-меню*\nОберіть дію:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=build_admin_menu_keyboard(user_id),
         parse_mode="Markdown"
     )
     track_msg(msg.chat_id, msg.message_id)
@@ -2062,11 +2074,17 @@ async def handle_admin_menu(update, context):
     await safe_answer(query)
     user_id = update.effective_user.id
 
-    if not is_admin(user_id):
+    if not can_manage_tasks(user_id):
         await safe_answer(query, "Немає прав.", show_alert=True)
         return
 
     action = query.data.replace("menu_", "")
+
+    # «Адміністратор» (can_manage_tasks, але не is_admin) має лише «Невиконані» та повернення;
+    # керування персоналом — тільки повним адмінам, керування промптом — лише власнику (нижче).
+    if action in {"staff", "pending", "changerole", "fire", "restore"} and not is_admin(user_id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
 
     if action == "unresolved":
         await show_unresolved(query, context)
@@ -2137,19 +2155,8 @@ async def handle_admin_menu(update, context):
         await query.edit_message_text("Оберіть співробітника для відновлення:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif action == "back":
-        keyboard = [
-            [InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
-            [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
-            [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
-            [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
-            [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
-            [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
-        ]
-        if is_owner(user_id):
-            keyboard.append([InlineKeyboardButton("📋 Поточний промпт", callback_data="menu_view_prompt")])
-            keyboard.append([InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")])
         await query.edit_message_text("👨‍💼 *Адмін-меню*\nОберіть дію:",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            reply_markup=build_admin_menu_keyboard(user_id), parse_mode="Markdown")
 
     elif action == "view_prompt":
         if not is_owner(user_id):
@@ -2221,18 +2228,8 @@ async def handle_admin_menu(update, context):
         context.user_data.pop('prompt_original', None)
         context.user_data.pop('prompt_msg_id', None)
         context.user_data.pop('prompt_chat_id', None)
-        keyboard = [
-            [InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
-            [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
-            [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
-            [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
-            [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
-            [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
-            [InlineKeyboardButton("📋 Поточний промпт", callback_data="menu_view_prompt")],
-            [InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")],
-        ]
         await query.edit_message_text("❌ Редагування скасовано.\n\n👨‍💼 *Адмін-меню*\nОберіть дію:",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            reply_markup=build_admin_menu_keyboard(user_id), parse_mode="Markdown")
 
 async def show_unresolved(query, context):
     """Показує невиконані завдання з повною клавіатурою і історією."""
