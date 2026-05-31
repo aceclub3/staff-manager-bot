@@ -10,6 +10,7 @@ SQLite-сховище для feedback-бота — єдина локальна �
   msgstore(key, data)  — кеш повідомлень {ids,text,photo,photo_path}, key = feedback_id
   assign(key, data)    — доручення, key = feedback_id
   chat(key, data)      — трекінг повідомлень для очищення, key = chat_id (рядком)
+  shiftreports(key, data) — підсумки змін персоналу (рефлексивний відгук), key = "telegram_id:YYYY-MM-DD"
   tasks(...)           — канонічний запис задачі (джерело правди для дайджесту/переліку)
   meta(k, v)           — службове
 
@@ -57,6 +58,7 @@ def init():
             CREATE TABLE IF NOT EXISTS msgstore (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS assign   (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS chat     (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS shiftreports (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks (
                 fid TEXT PRIMARY KEY,
                 created_date TEXT, created_time TEXT,

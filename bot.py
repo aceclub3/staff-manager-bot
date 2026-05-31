@@ -58,6 +58,12 @@ KITCHEN_CATEGORIES = {"Кухня", "Закупки"}
 CATEGORIES = ["Кухня", "Сервіс", "Техніка", "Закупки", "Гості", "Ідеї", "Чистота"]
 CATEGORY_ICONS = {"Кухня": "🍽️", "Сервіс": "👥", "Техніка": "🔧", "Закупки": "🛒", "Гості": "💬", "Ідеї": "💡", "Чистота": "🧹"}
 
+# ─── ПІДСУМКИ ЗМІН (рефлексивний відгук персоналу, окремо від задач) ──────────
+SHIFT_REPORT_BTN = "📝 Підсумок зміни"
+SHIFT_REPORTS_RETENTION_DAYS = 14      # старші за стільки днів — чистимо в дайджесті
+SHIFT_REPORTS_TO_SHEET = False         # опц. дзеркало в окрему вкладку Google Sheets (owner вмикає)
+SHIFT_REPORTS_SHEET_NAME = "Підсумки змін"
+
 STATUS_PENDING = "pending"
 STATUS_ACTIVE = "active"
 STATUS_FIRED = "fired"
@@ -168,6 +174,14 @@ assign_store = load_assign_store()
 # Канонічні задачі (джерело правди для дайджесту/переліку). Завантажуються тут,
 # а одноразова міграція з Google Sheet (якщо БД порожня) — у _post_init.
 tasks_store = storage.load_tasks()
+
+# Підсумки змін (рефлексивний відгук). Окреме KV-сховище — НІКОЛИ не tasks_store.
+# key = "telegram_id:YYYY-MM-DD"; value = {telegram_id, business_day, text, ...}.
+reports_store = storage.load_kv("shiftreports")
+# Кеш згенерованої Claude-сводки за день: {day: (count, text)} — щоб on-demand не кликав Claude повторно.
+_shift_summary_cache = {}
+# Хто вже отримав м'який нудж «лиши підсумок» сьогодні (in-memory; скидається при рестарті — ок).
+_shift_nudged = {}
 
 # ─── ПРОМПТ ───────────────────────────────────────────────────────────────────
 
@@ -324,14 +338,32 @@ def get_sheets_client():
 SHEET_NAME = "Зворотний зв'язок"
 SHEET_HEADER = ["Номер", "Дата", "Час", "Заклад", "Хто повідомив", "Роль", "Категорія",
                 "Суть", "Відповідальний", "Терміновість", "Фото", "Статус", "Лог"]
+REPORTS_SHEET_HEADER = ["Дата", "Час", "Заклад", "Хто", "Роль", "Анонім", "Джерело", "Текст"]
 _gc = None
 _ws = None
+_reports_ws = None
 _sheet_lock = threading.Lock()   # gspread/AuthorizedSession не потокобезпечні — серіалізуємо доступ
 
 def _reset_sheets_cache():
-    global _gc, _ws
+    global _gc, _ws, _reports_ws
     _gc = None
     _ws = None
+    _reports_ws = None
+
+def _get_reports_worksheet():
+    """Окрема вкладка для підсумків змін (створюється за потреби)."""
+    global _gc, _reports_ws
+    if _reports_ws is not None:
+        return _reports_ws
+    if _gc is None:
+        _gc = get_sheets_client()
+    ss = _gc.open_by_key(SPREADSHEET_ID)
+    try:
+        _reports_ws = ss.worksheet(SHIFT_REPORTS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        _reports_ws = ss.add_worksheet(SHIFT_REPORTS_SHEET_NAME, rows=1000, cols=len(REPORTS_SHEET_HEADER))
+        _reports_ws.append_row(REPORTS_SHEET_HEADER)
+    return _reports_ws
 
 def get_worksheet():
     """Повертає аркуш, кешуючи авторизований клієнт (без реавторизації на кожен виклик)."""
@@ -393,7 +425,8 @@ def _read_records():
 
 def get_main_keyboard(user_id):
     """Возвращает Reply-клавиатуру в зависимости от роли."""
-    buttons = [[KeyboardButton("💬 Надіслати повідомлення")]]
+    buttons = [[KeyboardButton("💬 Надіслати повідомлення")],
+               [KeyboardButton(SHIFT_REPORT_BTN)]]   # підсумок зміни — доступний усім активним
     if can_manage_tasks(user_id):
         buttons.append([KeyboardButton("👨‍💼 Адмін-меню")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -731,6 +764,15 @@ async def receive_text(update, context):
         schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
         return
 
+    # Підсумок зміни: вхід у режим по кнопці
+    if text == SHIFT_REPORT_BTN:
+        await enter_shift_report_mode(update, context)
+        return
+    # Підсумок зміни: наступний текст у режимі — це і є звіт
+    if context.user_data.get('report_mode'):
+        await process_shift_report(update, context)
+        return
+
     # Режим редагування промпту — тільки голосові, текст ігноруємо
     if context.user_data.get('prompt_editing') and is_owner(user_id):
         msg = await update.message.reply_text("🎙 Для редагування промпту надішліть *голосове* повідомлення.", parse_mode="Markdown")
@@ -777,6 +819,12 @@ async def receive_voice(update, context):
         track_msg(msg.chat_id, msg.message_id)
         schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
         return
+
+    # Підсумок зміни: голосовий звіт у режимі підсумку
+    if context.user_data.get('report_mode'):
+        await process_shift_report(update, context)
+        return
+
     processing_msg = await update.message.reply_text("🎙 Голосове отримано, обробляю...")
     track_msg(processing_msg.chat_id, processing_msg.message_id)
     schedule_delete(context, _bot, processing_msg.chat_id, processing_msg.message_id, delay=AUTO_DELETE_DELAY)
@@ -905,6 +953,14 @@ async def receive_photo(update, context):
     # Автовидалення фото користувача
     _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
+
+    # У режимі підсумку зміни фото не приймаємо (лише текст/голос); режим лишається активним.
+    if context.user_data.get('report_mode'):
+        msg = await update.message.reply_text(
+            "📝 Підсумок зміни приймає лише текст або голос. Надішліть текстом або голосом 👇")
+        track_msg(msg.chat_id, msg.message_id)
+        schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
+        return
 
     photo_file_id = update.message.photo[-1].file_id
 
@@ -1063,11 +1119,15 @@ async def process_message(query_or_update, context, profile, use_message=False):
     for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
         context.user_data.pop(key, None)
 
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
+    _uid = profile.get('telegram_id')
+    nudge = _shift_nudge_line() if _should_shift_nudge(_uid) else ""
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids) + nudge
     # БЕЗ reply_markup: це підтвердження автовидаляється (нижче). Reply-клавіатура
     # «прив'язана» до останнього повідомлення-носія, тож видалення носія прибрало б
     # постійні кнопки (зокрема «Адмін-меню»). Клавіатура й так живе на /start і в дайджесті.
     sent = await target.reply_text(confirm_text)
+    if sent and nudge:
+        _mark_shift_nudged(_uid)
     # Видаляємо підтвердження через 90 сек
     schedule_delete(context, get_bot(), sent.chat_id, sent.message_id, delay=90)
 
@@ -1098,12 +1158,16 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo']:
         user_data.pop(key, None)
 
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids)
+    nudge = _shift_nudge_line() if _should_shift_nudge(user_id) else ""
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids) + nudge
     # БЕЗ reply_markup — див. коментар у process(): носій reply-клавіатури не можна автовидаляти.
     sent = await safe_send_message(bot, chat_id, confirm_text, parse_mode=None)
-    if context and sent:
-        # Видаляємо підтвердження через 90 сек
-        schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
+    if sent:
+        if nudge:
+            _mark_shift_nudged(user_id)
+        if context:
+            # Видаляємо підтвердження через 90 сек
+            schedule_delete(context, bot, chat_id, sent.message_id, delay=90)
 
 
 # ─── ГОЛОС / ТРАНСКРИПЦІЯ ─────────────────────────────────────────────────────
@@ -1622,6 +1686,10 @@ async def handle_comment(update, context):
     user_id = update.effective_user.id
 
     cancel_user_jobs(context, user_id, "commentclear")
+    # не змішуємо з режимом підсумку зміни
+    cancel_user_jobs(context, user_id, "reportclear")
+    for k in ('report_mode', 'report_anonymous', 'report_prompt_msg_id', 'report_prompt_chat_id'):
+        context.user_data.pop(k, None)
 
     context.user_data['commenting_on'] = feedback_id
     context.user_data['comment_safe_id'] = safe_id
@@ -1741,6 +1809,338 @@ async def process_comment(update, context):
         schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=60)
 
     return True
+
+
+# ─── ПІДСУМКИ ЗМІН (рефлексивний відгук персоналу) ───────────────────────────
+# Окремо від задач: своя KV-таблиця shiftreports, ніяких статусів/кнопок задач,
+# ніколи не з'являються в переліку невиконаних. Менеджери бачать ЛИШЕ агреговану
+# Claude-сводку (раз/день у дайджесті + on-demand), а не пінг на кожен звіт.
+
+def _should_shift_nudge(user_id):
+    """Чи показувати м'який нудж: раз на день, лише активним. Не змінює стан (мітимо ПІСЛЯ відправки)."""
+    if not user_id:
+        return False
+    if _shift_nudged.get(user_id) == datetime.now().strftime("%Y-%m-%d"):
+        return False
+    return user_profiles.get(user_id, {}).get("status") == STATUS_ACTIVE
+
+def _shift_nudge_line():
+    return f"\n\n📝 Наприкінці зміни можна лишити підсумок — кнопка «{SHIFT_REPORT_BTN}» внизу."
+
+def _mark_shift_nudged(user_id):
+    if user_id:
+        _shift_nudged[user_id] = datetime.now().strftime("%Y-%m-%d")
+
+async def enter_shift_report_mode(update, context):
+    """Вмикає режим підсумку зміни: наступний текст/голос буде збережено як звіт."""
+    user_id = update.effective_user.id
+    prof = user_profiles.get(user_id)
+    if not prof or prof.get("status") != STATUS_ACTIVE:
+        await update.message.reply_text("Спочатку зареєструйтесь і дочекайтесь підтвердження: /start")
+        return
+    # Чистий перехід у режим підсумку: скасовуємо незавершену автовідправку (інакше за ~20с
+    # вона створила б випадкову задачу) і виходимо з інших режимів (коментар/редагування промпту),
+    # щоб не було конфлікту маршрутизації тексту/голосу.
+    cancel_user_jobs(context, user_id, "autosend")
+    cancel_user_jobs(context, user_id, "optdelete")
+    cancel_user_jobs(context, user_id, "photoclear")
+    cancel_user_jobs(context, user_id, "commentclear")
+    cancel_user_jobs(context, user_id, "promptedit")
+    cancel_user_jobs(context, user_id, "reportclear")
+    for k in ('waiting_for_option', 'pending_message', 'message_type', 'waiting_for_photo',
+              'pending_photo', 'option_message_id', 'option_chat_id',
+              'commenting_on', 'comment_safe_id', 'comment_prompt_msg_id', 'comment_prompt_chat_id',
+              'prompt_editing', 'prompt_working', 'prompt_original', 'prompt_msg_id', 'prompt_chat_id'):
+        context.user_data.pop(k, None)
+    context.user_data['report_mode'] = True
+    context.user_data['report_anonymous'] = False
+    bot = get_bot()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🕵️ Анонімно", callback_data="report_anon"),
+        InlineKeyboardButton("❌ Скасувати", callback_data="report_cancel"),
+    ]])
+    sent = await safe_send_message(
+        bot, update.effective_chat.id,
+        "🌙 *Підсумок зміни.* Як пройшла зміна? Що добре, що покращити, побажання?\n"
+        "Напишіть або надиктуйте одним повідомленням 👇\n_(необов'язково; автоскасується за 2 хв)_",
+        reply_markup=keyboard, parse_mode="Markdown")
+    if sent:
+        track_msg(sent.chat_id, sent.message_id)
+        context.user_data['report_prompt_msg_id'] = sent.message_id
+        context.user_data['report_prompt_chat_id'] = sent.chat_id
+    context.job_queue.run_once(
+        report_clear_callback, when=120, name=f"reportclear_{user_id}",
+        data={"user_id": user_id, "chat_id": update.effective_chat.id})
+
+async def report_clear_callback(context):
+    """Скидає режим підсумку зміни через 2 хв (клон comment_clear_callback)."""
+    user_id = context.job.data["user_id"]
+    user_data = context.application.user_data.get(user_id, {})
+    if user_data.get('report_mode'):
+        user_data.pop('report_mode', None)
+        user_data.pop('report_anonymous', None)
+        pmid = user_data.pop('report_prompt_msg_id', None)
+        pcid = user_data.pop('report_prompt_chat_id', None)
+        bot = get_bot()
+        if pmid and pcid:
+            try:
+                await bot.edit_message_text(chat_id=pcid, message_id=pmid,
+                    text="⏱ Час вийшов. Режим підсумку зміни скасовано.")
+                schedule_delete(context, bot, pcid, pmid, delay=30)
+            except Exception:
+                pass
+
+async def handle_report_cancel(update, context):
+    """Скасування режиму підсумку зміни кнопкою."""
+    query = update.callback_query
+    await safe_answer(query)
+    user_id = update.effective_user.id
+    cancel_user_jobs(context, user_id, "reportclear")
+    for k in ('report_mode', 'report_anonymous', 'report_prompt_msg_id', 'report_prompt_chat_id'):
+        context.user_data.pop(k, None)
+    try:
+        await query.edit_message_text("❌ Підсумок зміни скасовано.")
+    except Exception:
+        pass
+    schedule_delete(context, get_bot(), query.message.chat_id, query.message.message_id, delay=30)
+
+async def handle_report_anon(update, context):
+    """Перемикач анонімності в режимі підсумку зміни."""
+    query = update.callback_query
+    if not context.user_data.get('report_mode'):
+        await safe_answer(query, "Режим підсумку вже завершено.", show_alert=True)
+        return
+    anon = not context.user_data.get('report_anonymous', False)
+    context.user_data['report_anonymous'] = anon
+    await safe_answer(query, "🕵️ Анонімно увімкнено" if anon else "👤 Анонімність вимкнено")
+    label = "✅ 🕵️ Анонімно" if anon else "🕵️ Анонімно"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data="report_anon"),
+        InlineKeyboardButton("❌ Скасувати", callback_data="report_cancel"),
+    ]])
+    try:
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+    except Exception:
+        pass
+
+def save_shift_report(user_id, profile, text, source, anonymous):
+    """Upsert звіту за (user, день). Повторно того ж дня — ДОПИСУЄ. Повертає True якщо дописано.
+    Анонімність застосовується до всього рядка (ім'я/роль прибираються), заклад лишається."""
+    day = datetime.now().strftime("%Y-%m-%d")
+    key = f"{user_id}:{day}"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing = reports_store.get(key)
+    appended = False
+    if isinstance(existing, dict) and existing.get("text"):
+        existing["text"] = existing["text"].rstrip() + "\n— — —\n" + text
+        existing["updated_at"] = now
+        if anonymous:
+            existing["is_anonymous"] = True
+            existing["sender_name"] = None
+            existing["sender_role"] = None
+        rec = existing
+        appended = True
+    else:
+        rec = {
+            "telegram_id": user_id, "business_day": day,
+            "created_at": now, "updated_at": now,
+            "sender_name": None if anonymous else get_display_name(profile),
+            "sender_role": None if anonymous else profile.get("role", "—"),
+            "restaurant": profile.get("restaurant", "—"),
+            "is_anonymous": bool(anonymous), "text": text, "source": source,
+        }
+    reports_store[key] = rec
+    storage.kv_put("shiftreports", key, rec)
+    _shift_summary_cache.pop(day, None)          # інвалідовуємо кеш сводки за сьогодні
+    if SHIFT_REPORTS_TO_SHEET:
+        asyncio.create_task(_mirror_report_to_sheet(rec))
+    return appended
+
+async def process_shift_report(update, context):
+    """Зберігає підсумок зміни (текст або голос); викликається у report_mode."""
+    user_id = update.effective_user.id
+    bot = get_bot()
+    profile = user_profiles.get(user_id, {})
+    if update.message.voice:
+        try:
+            vf = await update.message.voice.get_file()
+            fp = os.path.join(tempfile.gettempdir(), f"shift_{user_id}_{uuid.uuid4().hex[:8]}.ogg")
+            await vf.download_to_drive(fp)
+            text = await transcribe_voice(fp)     # видаляє файл у finally
+        except Exception as e:
+            logger.error(f"Shift report voice error: {e}")
+            text = None
+        source = "voice"
+    else:
+        text = update.message.text or ""
+        source = "text"
+
+    anonymous = bool(context.user_data.get('report_anonymous'))
+    cancel_user_jobs(context, user_id, "reportclear")
+    context.user_data.pop('report_mode', None)
+    context.user_data.pop('report_anonymous', None)
+    pmid = context.user_data.pop('report_prompt_msg_id', None)
+    pcid = context.user_data.pop('report_prompt_chat_id', None)
+
+    if not text or not text.strip():
+        out = "❌ Не вдалося розпізнати підсумок. Натисніть кнопку ще раз."
+    else:
+        appended = save_shift_report(user_id, profile, text.strip(), source, anonymous)
+        out = "✅ Підсумок зміни оновлено 🙏" if appended else "✅ Дякуємо! Підсумок зміни збережено 🙏"
+
+    # Редагуємо промпт (інакше — нове повідомлення); БЕЗ reply-клавіатури, з автовидаленням.
+    if pmid and pcid:
+        try:
+            await bot.edit_message_text(chat_id=pcid, message_id=pmid, text=out)
+            schedule_delete(context, bot, pcid, pmid, delay=AUTO_DELETE_DELAY)
+            return
+        except Exception:
+            pass
+    sent = await safe_send_message(bot, update.effective_chat.id, out, parse_mode=None)
+    if sent:
+        track_msg(sent.chat_id, sent.message_id)
+        schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=AUTO_DELETE_DELAY)
+
+def _shift_reports_for_day(day):
+    """Список звітів (dict) за вказаний business_day."""
+    return [v for v in reports_store.values()
+            if isinstance(v, dict) and v.get("business_day") == day]
+
+def _fallback_shift_summary(reports):
+    """Простий список, якщо Claude недоступний (plain text, без markdown)."""
+    parts = []
+    for r in reports:
+        who = "анонім" if r.get("is_anonymous") else (r.get("sender_name") or "—")
+        t = (r.get("text", "") or "")[:300]
+        parts.append(f"• [{r.get('restaurant', '—')}] {who}: {t}")
+    return "\n".join(parts) if parts else "—"
+
+def _summarize_shift_reports_sync(reports):
+    """Згортає звіти у компактну сводку — ОДИН виклик Claude."""
+    lines = []
+    for r in reports:
+        who = "анонім" if r.get("is_anonymous") else (r.get("sender_name") or "—")
+        lines.append(f"[{r.get('restaurant', '—')}] {who}: {r.get('text', '')}")
+    prompt = (
+        "Ось підсумки змін персоналу ресторанів за день (по одному на рядок, у дужках — заклад).\n"
+        "Стисло згрупуй ПО ЗАКЛАДАХ. Для кожного заклада: загальний настрій, 2-4 повторювані теми "
+        "(познач, якщо згадували кілька людей), ідеї покращень і конкретні проблеми. "
+        "НЕ цитуй дослівно, НЕ вигадуй. Якщо звітів мало — коротко. "
+        "Формат рядків: заголовок '🍽 <Заклад>' і марковані пункти '• ...'.\n\n"
+        + "\n".join(lines)
+    )
+    resp = _call_claude_sync(prompt, max_tokens=900)
+    return resp.content[0].text.strip()
+
+async def _render_shift_summary(day, reports):
+    """Текст сводки за день; кеш за (day,count); фолбек — простий список."""
+    count = len(reports)
+    cached = _shift_summary_cache.get(day)
+    if cached and cached[0] == count:
+        return cached[1]
+    try:
+        text = await _arun(lambda: _retry_sync(lambda: _summarize_shift_reports_sync(reports)))
+    except Exception as e:
+        logger.error(f"Shift summary Claude failed: {e}")
+        text = _fallback_shift_summary(reports)
+    _shift_summary_cache[day] = (count, text)
+    return text
+
+async def send_shift_reports_section(bot, recipients, context):
+    """Додає у дайджест ОДИН агрегований блок підсумків змін за вчора. Тихий день — нічого."""
+    yday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    reports = _shift_reports_for_day(yday)
+    if not reports:
+        return
+    ymd = (datetime.now() - timedelta(days=1)).strftime("%d.%m")
+    summary = await _render_shift_summary(yday, reports)
+    body = f"📝 Підсумки змін за {ymd} ({len(reports)})\n\n{summary}"
+    for uid in recipients:
+        msg = await safe_send_message(bot, uid, body, parse_mode=None)
+        if msg:
+            track_msg(uid, msg.message_id)
+
+def _purge_old_shift_reports():
+    """Чистить звіти старші за SHIFT_REPORTS_RETENTION_DAYS (рядки YYYY-MM-DD порівнюються лексикографічно)."""
+    cutoff = (datetime.now() - timedelta(days=SHIFT_REPORTS_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    old = [k for k, v in list(reports_store.items())
+           if isinstance(v, dict) and str(v.get("business_day", "")) < cutoff]
+    for k in old:
+        reports_store.pop(k, None)
+        storage.kv_delete("shiftreports", k)
+    if old:
+        logger.info(f"Purged {len(old)} old shift reports (< {cutoff})")
+
+async def show_shift_reports(query, context):
+    """On-demand для менеджерів: Claude-сводка + окремі звіти з кнопкою ескалації в задачу."""
+    uid = query.from_user.id
+    bot = get_bot()
+    today = datetime.now().strftime("%Y-%m-%d")
+    yday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    day = today if _shift_reports_for_day(today) else yday
+    reports = _shift_reports_for_day(day)
+    if not reports:
+        await query.edit_message_text("📝 Підсумків змін поки немає.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]))
+        return
+    await delete_tracked_messages(bot, [uid])
+    ymd = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    summary = await _render_shift_summary(day, reports)
+    head = await safe_send_message(bot, uid, f"📝 Підсумки змін за {ymd} ({len(reports)})\n\n{summary}",
+                                   reply_markup=get_main_keyboard(uid), parse_mode=None)
+    if head:
+        track_msg(uid, head.message_id)
+    for r in reports:
+        key = f"{r.get('telegram_id')}:{r.get('business_day')}"
+        who = "анонім" if r.get("is_anonymous") else (r.get("sender_name") or "—")
+        txt = f"🌙 [{r.get('restaurant', '—')}] {who}\n{r.get('text', '')}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Створити задачу", callback_data=f"r2task_{key}")]])
+        m = await safe_send_message(bot, uid, txt, reply_markup=kb, parse_mode=None)
+        if m:
+            track_msg(uid, m.message_id)
+            schedule_delete(context, bot, uid, m.message_id, delay=TASK_DELETE_DELAY)
+
+async def handle_report_to_task(update, context):
+    """Ескалація одного звіту в звичайну задачу (ручна, для can_manage_tasks).
+    Права перевіряємо ДО відповіді на callback (його можна відповісти лише раз)."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not can_manage_tasks(user_id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
+    key = query.data[len("r2task_"):]
+    rec = reports_store.get(key)
+    if not isinstance(rec, dict) or not rec.get("text"):
+        await safe_answer(query, "Звіт не знайдено.", show_alert=True)
+        return
+    await safe_answer(query, "Створюю задачу…")
+    profile = {"restaurant": rec.get("restaurant", "Терраса"), "role": rec.get("sender_role") or "—"}
+    user_data = {"sender_name": rec.get("sender_name") or "Підсумок зміни",
+                 "sender_role": rec.get("sender_role") or "—"}
+    results = await analyze_with_claude(rec["text"], profile, is_anonymous=bool(rec.get("is_anonymous")))
+    _, ids = await _save_and_notify(results, user_data, profile, None, context)
+    # Підтвердження — редагуванням повідомлення (видиме й стійке), кнопку прибираємо.
+    base = query.message.text if query.message else ""
+    try:
+        await query.edit_message_text(f"{base}\n\n✅ Створено задачу(і): {', '.join(str(i) for i in ids)}")
+    except Exception:
+        pass
+
+async def _mirror_report_to_sheet(rec):
+    """Опц. дзеркало звіту в окрему вкладку Google Sheets (best-effort, off за замовч.)."""
+    def _do():
+        ws = _get_reports_worksheet()
+        c = rec.get("created_at", "")
+        ws.append_row([
+            rec.get("business_day", ""), c[11:16] if len(c) >= 16 else "",
+            rec.get("restaurant", "—"), rec.get("sender_name") or "—",
+            rec.get("sender_role") or "—", "так" if rec.get("is_anonymous") else "—",
+            rec.get("source", "text"), rec.get("text", ""),
+        ])
+    try:
+        await _arun(lambda: _sheet_retry(_do))
+    except Exception as e:
+        logger.error(f"Shift report sheet mirror failed: {e}")
 
 
 # ─── ДАЙДЖЕСТ / ДНИ НАРОДЖЕННЯ ───────────────────────────────────────────────
@@ -1864,6 +2264,10 @@ async def send_unresolved_digest(context):
                                               reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
                 if msg:
                     track_msg(uid, msg.message_id)
+
+        # ── 2.5 Підсумки змін за вчора (агрегована Claude-сводка; тихий день — нічого) ──
+        await send_shift_reports_section(bot, recipients, context)
+        _purge_old_shift_reports()
 
         # ── 3. Невиконані завдання ────────────────────────────────────────────
         if not unresolved:
@@ -2057,7 +2461,8 @@ def build_admin_menu_keyboard(user_id):
     """Меню залежно від ролі. «Адміністратор» (can_manage_tasks, але НЕ is_admin) —
     лише «Невиконані завдання»; повні адміни (Управляючий/Виконавчий директор/власник) —
     увесь набір; власник — додатково керування промптом."""
-    keyboard = [[InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")]]
+    keyboard = [[InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
+                [InlineKeyboardButton("📝 Підсумки змін", callback_data="menu_shiftreports")]]
     if is_admin(user_id):
         keyboard += [
             [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
@@ -2106,6 +2511,10 @@ async def handle_admin_menu(update, context):
 
     if action == "unresolved":
         await show_unresolved(query, context)
+        return
+
+    if action == "shiftreports":
+        await show_shift_reports(query, context)
         return
 
     elif action == "staff":
@@ -2546,6 +2955,7 @@ async def _post_init(app):
                  'waiting_for_photo', 'option_message_id', 'option_chat_id', 'is_anonymous',
                  'sender_name', 'sender_role', 'commenting_on', 'comment_safe_id',
                  'comment_prompt_msg_id', 'comment_prompt_chat_id',
+                 'report_mode', 'report_anonymous', 'report_prompt_msg_id', 'report_prompt_chat_id',
                  'prompt_editing', 'prompt_working', 'prompt_original', 'prompt_msg_id', 'prompt_chat_id')
     try:
         for ud in app.user_data.values():
@@ -2663,6 +3073,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_assign_cancel, pattern="^assigncancel_"))
     app.add_handler(CallbackQueryHandler(handle_comment, pattern="^comment_(?!cancel_mode)"))
     app.add_handler(CallbackQueryHandler(handle_comment_cancel_mode, pattern="^comment_cancel_mode$"))
+    app.add_handler(CommandHandler("shift", enter_shift_report_mode))
+    app.add_handler(CallbackQueryHandler(handle_report_anon, pattern="^report_anon$"))
+    app.add_handler(CallbackQueryHandler(handle_report_cancel, pattern="^report_cancel$"))
+    app.add_handler(CallbackQueryHandler(handle_report_to_task, pattern="^r2task_"))
     app.add_handler(CallbackQueryHandler(handle_admin_menu, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(handle_admin_role_select, pattern="^adminrole_"))
     app.add_handler(CallbackQueryHandler(handle_admin_set_role, pattern="^adminsetrole_"))

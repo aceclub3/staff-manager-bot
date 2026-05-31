@@ -62,6 +62,7 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
 | `msgstore` | кеш повідомлень `{ids:{uid:msg_id}, text, photo(file_id), photo_path}` (JSON) | fid |
 | `assign` | кому доручено (JSON) | fid |
 | `chat` | id повідомлень бота в кожному чаті для очищення (JSON) | chat_id |
+| `shiftreports` | **підсумки змін** (рефлексивний відгук персоналу: `{telegram_id, business_day, text, sender_name, sender_role, restaurant, is_anonymous, source}`) — окремо від задач | `telegram_id:YYYY-MM-DD` |
 | `meta` | службове | k |
 
 - **Атомарність**: KV-таблиці пишуться транзакцією (`save_kv` = DELETE+INSERT, або `kv_put` per-key); `tasks` — upsert. Пошкодження неможливе.
@@ -121,6 +122,23 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
 
 ### 4.7 Ручний перелік (`show_unresolved`, кнопка «🔴 Невиконані завдання»)
 Те саме, що дайджест, але читає `tasks_store` для одного адміна за запитом.
+
+### 4.9 Підсумки змін (рефлексивний відгук персоналу)
+Окремо від задач. Будь-який активний співробітник наприкінці зміни тисне reply-кнопку
+**«📝 Підсумок зміни»** (або `/shift`) → 2-хв режим (`report_mode`) → наступний текст/голос
+(Whisper) зберігається як звіт. Inline `🕵️ Анонімно` / `❌ Скасувати`.
+- **Зберігання**: `save_shift_report` → таблиця `shiftreports` (ключ `telegram_id:день`, одна
+  на людину/день; повторно того ж дня — ДОПИСУЄ). Анонімність прибирає ім'я/роль, лишає заклад.
+  **Ніколи не пише в `tasks_store`/`msgstore`** — повна ізоляція від задач.
+- **Менеджерам — БЕЗ пінгів на кожен звіт.** Раз/день у дайджесті (`send_shift_reports_section`,
+  до раннього `return`) — ОДИН агрегований Claude-блок по закладах (`_summarize_shift_reports_sync`
+  через `_arun`, кеш `_shift_summary_cache`, fallback-список без Claude). Тихий день — нічого.
+  On-demand: «📝 Підсумки змін» в адмін-меню (`show_shift_reports`) — сводка + окремі звіти з
+  кнопкою «➕ Створити задачу» (`handle_report_to_task` → `analyze_with_claude`/`_save_and_notify`).
+- **Ескалація в задачу — лише вручну** (кнопка), ніколи автоматично.
+- Ретенція `SHIFT_REPORTS_RETENTION_DAYS` (14 дн.), чистка `_purge_old_shift_reports` у дайджесті.
+- М'який нудж «лиши підсумок» — один рядок у першому підтвердженні задачі за день (`_should_shift_nudge`,
+  мітимо ПІСЛЯ успішної відправки). Опц. дзеркало в окрему вкладку Sheets — `SHIFT_REPORTS_TO_SHEET` (off).
 
 ### 4.8 Інше
 - Привітання з ДН (`send_birthday_greetings`, 06:00).
