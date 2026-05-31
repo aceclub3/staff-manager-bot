@@ -966,29 +966,32 @@ async def photo_waiting_clear_callback(context):
 
 
 async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
-    """Завантажує фото з Telegram на основне локальне сховище (E:) і дублює копію
-    на Google Drive (G:). Повертає шлях основного файлу (для резерву) або ''."""
-    primary_path = ""
+    """Завантажує фото з Telegram ОДИН раз і зберігає НЕЗАЛЕЖНО на основне сховище (E:)
+    та копію на Google Drive (G:). Падіння одного диска не блокує інший. Повертає шлях
+    ПЕРШОГО успішно збереженого файлу (E: у пріоритеті) для локального резерву, або ''
+    (доставка фото все одно тримається на Telegram file_id незалежно від диска)."""
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
         bot = get_bot()
         tg_file = await bot.get_file(file_id)
-        today = datetime.now().strftime("%Y-%m-%d")
-        primary_dir = os.path.join(PHOTO_PRIMARY_PATH, today)
-        os.makedirs(primary_dir, exist_ok=True)
-        primary_path = os.path.join(primary_dir, filename)
-        await tg_file.download_to_drive(primary_path)
-        logger.info(f"Photo saved (primary): {primary_path}")
+        data = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
-        logger.error(f"Photo primary save error: {e}")
+        logger.error(f"Photo download error: {e}")
         return ""
-    # Дзеркало на G: (необов'язкове — якщо диск не змонтований, просто лог)
-    try:
-        mirror_dir = os.path.join(PHOTO_MIRROR_PATH, datetime.now().strftime("%Y-%m-%d"))
-        os.makedirs(mirror_dir, exist_ok=True)
-        shutil.copy2(primary_path, os.path.join(mirror_dir, filename))
-    except Exception as e:
-        logger.error(f"Photo mirror to G: failed: {e}")
-    return primary_path
+    saved_path = ""
+    for label, base in (("primary E:", PHOTO_PRIMARY_PATH), ("mirror G:", PHOTO_MIRROR_PATH)):
+        try:
+            target_dir = os.path.join(base, today)
+            os.makedirs(target_dir, exist_ok=True)
+            path = os.path.join(target_dir, filename)
+            with open(path, "wb") as fh:
+                fh.write(data)
+            logger.info(f"Photo saved ({label}): {path}")
+            if not saved_path:
+                saved_path = path   # E: у пріоритеті як шлях резерву
+        except Exception as e:
+            logger.error(f"Photo save to {label} failed: {e}")
+    return saved_path
 
 
 async def _save_and_notify(results, user_data, profile, photo_file_id, context):
@@ -1766,6 +1769,19 @@ def _store_task_message(fid, uid, message_id, text, photo=None, photo_path=""):
     msg_store[fid] = entry
 
 
+def _photo_deliverable(fid):
+    """True, якщо для задачі є РЕАЛЬНО доставне фото: збережений Telegram file_id
+    або наявний локальний файл. Маркер 📷 ставимо лише тоді — інакше історичні/імпортовані
+    з таблиці задачі (has_photo=True, але file_id у msgstore немає) показували б 📷 без фото."""
+    entry = msg_store.get(fid)
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("photo"):
+        return True
+    pp = entry.get("photo_path", "")
+    return bool(pp) and os.path.exists(pp)
+
+
 def build_row_text(row, fid, safe_id):
     """Формує текст і клавіатуру для рядка задачі з таблиці."""
     status = str(row.get("Статус", "Нове"))
@@ -1777,7 +1793,9 @@ def build_row_text(row, fid, safe_id):
     sender = row.get("Хто повідомив", "—")
     summary = row.get("Суть", "—")
     history = row.get("Лог", "")
-    has_photo = str(row.get("Фото", "")).strip().startswith("є")
+    # Маркер 📷 — за реальною доставністю фото (msgstore), а не за tasks.has_photo,
+    # щоб не показувати 📷 на імпортованих задачах без збереженого file_id.
+    has_photo = _photo_deliverable(fid)
     date_str = f"{date} {time_val}".strip()
 
     assigned = fid in assign_store
