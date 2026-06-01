@@ -2016,20 +2016,28 @@ def _fallback_shift_summary(reports):
     return "\n".join(parts) if parts else "—"
 
 def _summarize_shift_reports_sync(reports):
-    """Згортає звіти у компактну сводку — ОДИН виклик Claude."""
+    """Впорядковує звіти для керівника, МАКСИМАЛЬНО зберігаючи формулювання — ОДИН виклик Claude.
+    Не стискає заради стислості й нічого не додумує (краще дослівно, ніж перекрутити)."""
     lines = []
     for r in reports:
         who = "анонім" if r.get("is_anonymous") else (r.get("sender_name") or "—")
         lines.append(f"[{r.get('restaurant', '—')}] {who}: {r.get('text', '')}")
     prompt = (
         "Ось підсумки змін персоналу ресторанів за день (по одному на рядок, у дужках — заклад).\n"
-        "Стисло згрупуй ПО ЗАКЛАДАХ. Для кожного заклада: загальний настрій, 2-4 повторювані теми "
-        "(познач, якщо згадували кілька людей), ідеї покращень і конкретні проблеми. "
-        "НЕ цитуй дослівно, НЕ вигадуй. Якщо звітів мало — коротко. "
-        "Формат рядків: заголовок '🍽 <Заклад>' і марковані пункти '• ...'.\n\n"
+        "Впорядкуй їх для керівника, МАКСИМАЛЬНО ЗБЕРІГАЮЧИ зміст і формулювання працівників. Правила:\n"
+        "1) Прибирай ЛИШЕ зайві/порожні слова (вода, повтори, «ну», «короче», вигуки) — суть НЕ скорочуй.\n"
+        "2) За замовчуванням давай ПОВНО: краще довше, ніж втратити деталь, цифру чи нюанс. "
+        "Не стискай заради стислості.\n"
+        "3) НЕ перефразовуй на свій лад і НЕ перекручуй сказане. Якщо не впевнений, як сформулювати "
+        "коротше — наведи ДОСЛІВНО, як сказав працівник.\n"
+        "4) НІЧОГО не додумуй і не додавай від себе — лише те, що реально є в тексті.\n"
+        "5) Зберігай конкретику: імена, цифри, назви обладнання, столики, час тощо.\n"
+        "6) Згрупуй ПО ЗАКЛАДАХ. Якщо кілька людей сказали те саме — об'єднай і познач (×N), "
+        "але унікальні деталі окремих людей не втрачай.\n"
+        "Формат: заголовок '🍽 <Заклад>', далі марковані пункти '• ...'. Анонімні — без імені.\n\n"
         + "\n".join(lines)
     )
-    resp = _call_claude_sync(prompt, max_tokens=900)
+    resp = _call_claude_sync(prompt, max_tokens=2000)
     return resp.content[0].text.strip()
 
 async def _render_shift_summary(day, reports):
@@ -2046,6 +2054,32 @@ async def _render_shift_summary(day, reports):
     _shift_summary_cache[day] = (count, text)
     return text
 
+async def _send_summary_block(bot, uid, body, with_keyboard=False):
+    """Шле зведення; якщо довше за ліміт Telegram (~4096) — ріже по рядках на частини, щоб
+    повніший текст не загубився. Кожну частину трекаємо; reply-клавіатуру (за потреби) чіпляємо
+    лише до ПЕРШОЇ частини (вона постійна, не автовидаляється). Повертає перше повідомлення."""
+    LIMIT = 3900
+    chunks, cur = [], ""
+    for line in body.split("\n"):
+        while len(line) > LIMIT:                       # один наддовгий рядок теж ріжемо
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:LIMIT]); line = line[LIMIT:]
+        if cur and len(cur) + 1 + len(line) > LIMIT:
+            chunks.append(cur); cur = ""
+        cur = (cur + "\n" + line) if cur else line
+    if cur:
+        chunks.append(cur)
+    first = None
+    for i, ch in enumerate(chunks):
+        rm = get_main_keyboard(uid) if (with_keyboard and i == 0) else None
+        m = await safe_send_message(bot, uid, ch, reply_markup=rm, parse_mode=None)
+        if m:
+            track_msg(uid, m.message_id)
+            if first is None:
+                first = m
+    return first
+
 async def send_shift_reports_section(bot, recipients, context):
     """Додає у дайджест ОДИН агрегований блок підсумків змін за вчора. Тихий день — нічого."""
     yday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -2056,9 +2090,7 @@ async def send_shift_reports_section(bot, recipients, context):
     summary = await _render_shift_summary(yday, reports)
     body = f"📝 Підсумки змін за {ymd} ({len(reports)})\n\n{summary}"
     for uid in recipients:
-        msg = await safe_send_message(bot, uid, body, parse_mode=None)
-        if msg:
-            track_msg(uid, msg.message_id)
+        await _send_summary_block(bot, uid, body)
 
 def _purge_old_shift_reports():
     """Чистить звіти старші за SHIFT_REPORTS_RETENTION_DAYS (рядки YYYY-MM-DD порівнюються лексикографічно)."""
@@ -2086,10 +2118,8 @@ async def show_shift_reports(query, context):
     await delete_tracked_messages(bot, [uid])
     ymd = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     summary = await _render_shift_summary(day, reports)
-    head = await safe_send_message(bot, uid, f"📝 Підсумки змін за {ymd} ({len(reports)})\n\n{summary}",
-                                   reply_markup=get_main_keyboard(uid), parse_mode=None)
-    if head:
-        track_msg(uid, head.message_id)
+    body = f"📝 Підсумки змін за {ymd} ({len(reports)})\n\n{summary}"
+    await _send_summary_block(bot, uid, body, with_keyboard=True)
     for r in reports:
         key = f"{r.get('telegram_id')}:{r.get('business_day')}"
         who = "анонім" if r.get("is_anonymous") else (r.get("sender_name") or "—")
