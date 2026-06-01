@@ -21,3 +21,6 @@ bot_log.txt
 *.db
 *.db-wal
 *.db-shm
+
+# local archive of old scripts
+Архив/
