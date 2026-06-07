@@ -39,7 +39,20 @@ TASK_COLS = [
     "fid", "created_date", "created_time", "restaurant", "sender_name", "sender_role",
     "category", "summary", "responsible", "urgency", "has_photo", "status", "log",
     "seq", "updated_at",
+    # додані поля (аудит): зворотний зв'язок зі звітником, вік/ескалація, дата закриття
+    "reporter_id", "created_ts", "acknowledged_at", "completed_date", "escalated", "assignee_id",
 ]
+
+# Очікувані колонки таблиці tasks (для авто-міграції ADD COLUMN на старій БД)
+_TASK_TABLE_COLS = {
+    "fid": "TEXT PRIMARY KEY", "created_date": "TEXT", "created_time": "TEXT",
+    "restaurant": "TEXT", "sender_name": "TEXT", "sender_role": "TEXT",
+    "category": "TEXT", "summary": "TEXT", "responsible": "TEXT", "urgency": "TEXT",
+    "has_photo": "INTEGER DEFAULT 0", "status": "TEXT DEFAULT 'Нове'", "log": "TEXT DEFAULT ''",
+    "seq": "INTEGER", "updated_at": "TEXT",
+    "reporter_id": "INTEGER", "created_ts": "TEXT", "acknowledged_at": "TEXT",
+    "completed_date": "TEXT", "escalated": "INTEGER DEFAULT 0", "assignee_id": "INTEGER",
+}
 
 
 def init():
@@ -52,28 +65,101 @@ def init():
     with _lock:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
+        cols_sql = ",\n                ".join(f"{c} {t}" for c, t in _TASK_TABLE_COLS.items())
         _conn.executescript(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS profiles (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS msgstore (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS assign   (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS chat     (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS shiftreports (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks (
-                fid TEXT PRIMARY KEY,
-                created_date TEXT, created_time TEXT,
-                restaurant TEXT, sender_name TEXT, sender_role TEXT,
-                category TEXT, summary TEXT, responsible TEXT, urgency TEXT,
-                has_photo INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'Нове',
-                log TEXT DEFAULT '',
-                seq INTEGER,
-                updated_at TEXT
+                {cols_sql}
             );
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
             """
         )
+        # Авто-міграція: додаємо відсутні колонки в існуючу таблицю tasks
+        existing = {r["name"] for r in _conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        for col, decl in _TASK_TABLE_COLS.items():
+            if col not in existing:
+                add_decl = decl.replace(" PRIMARY KEY", "")
+                try:
+                    _conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {add_decl}")
+                    logger.info(f"Schema migration: added tasks.{col}")
+                except Exception as e:
+                    logger.error(f"ALTER tasks ADD {col} failed: {e}")
         _conn.commit()
+
+
+# ─── ДОВГОВІЧНІСТЬ: checkpoint / backup / meta / close ───────────────────────
+
+def checkpoint():
+    """Зливає WAL у основний файл (щоб бекап-копія .db була повною, а WAL не ріс)."""
+    try:
+        with _lock:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as e:
+        logger.error(f"WAL checkpoint failed: {e}")
+
+
+def backup_to(dest_path):
+    """Створює узгоджену копію всієї БД (WAL+main) одним файлом через VACUUM INTO."""
+    tmp = dest_path + ".tmp"
+    with _lock:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        _conn.execute("VACUUM INTO ?", (tmp,))
+    os.replace(tmp, dest_path)
+    return dest_path
+
+
+def integrity_ok(path):
+    """Перевіряє цілісність файлу-бекапу (open read-only)."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            n = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            return ok and n >= 0
+        finally:
+            c.close()
+    except Exception as e:
+        logger.error(f"Backup integrity check failed {path}: {e}")
+        return False
+
+
+def meta_get(k, default=None):
+    with _lock:
+        row = _conn.execute("SELECT v FROM meta WHERE k = ?", (k,)).fetchone()
+    return row["v"] if row else default
+
+
+def meta_set(k, v):
+    with _lock:
+        with _conn:
+            _conn.execute(
+                "INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (k, str(v)),
+            )
+
+
+def close():
+    """Коректно зливає WAL і закриває з'єднання (виклик у finally при зупинці)."""
+    global _conn
+    if _conn is None:
+        return
+    try:
+        with _lock:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _conn.close()
+    except Exception as e:
+        logger.error(f"DB close failed: {e}")
+    finally:
+        _conn = None
 
 
 # ─── KV-сховища (profiles / msgstore / assign / chat) ────────────────────────

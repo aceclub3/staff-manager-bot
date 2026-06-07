@@ -57,6 +57,16 @@ ADMIN_ROLES = {"Управляючий", "Виконавчий директор"
 KITCHEN_CATEGORIES = {"Кухня", "Закупки"}
 CATEGORIES = ["Кухня", "Сервіс", "Техніка", "Закупки", "Гості", "Ідеї", "Чистота"]
 CATEGORY_ICONS = {"Кухня": "🍽️", "Сервіс": "👥", "Техніка": "🔧", "Закупки": "🛒", "Гості": "💬", "Ідеї": "💡", "Чистота": "🧹"}
+URGENCY_ICONS = {"Висока": "🔥", "Стандартна": "", "Низька": "🟢"}
+
+# ─── МАРШРУТИЗАЦІЯ / ТЕРМІНОВІСТЬ / SLA / БЕКАП (аудит) ───────────────────────
+GROUP_ROLES = {"Виконавчий директор"}            # бачать усі заклади (як власник)
+VENUE_ROLES = {"Управляючий", "Адміністратор"}    # обмежені своїм закладом
+REALTIME_URGENCY = {"Висока", "Стандартна"}       # реалтайм-пінг; "Низька" — лише в дайджесті
+SLA_HOURS = {"Висока": 2, "Стандартна": 24, "Низька": 72}
+ESCALATE_URGENCY = {"Висока"}                     # прострочені цих — ескалюємо власнику
+BACKUP_DIRS = [r"E:\Denys\Feedback\Бекап", r"G:\Мой диск\BOTS\Feedback\Бекап"]
+BACKUP_RETENTION = 21                             # скільки денних копій тримати
 
 # ─── ПІДСУМКИ ЗМІН (рефлексивний відгук персоналу, окремо від задач) ──────────
 SHIFT_REPORT_BTN = "📝 Підсумок зміни"
@@ -294,18 +304,56 @@ def build_wip_keyboard(safe_id, assigned=False):
         InlineKeyboardButton("🗑️", callback_data=f"status_del_{safe_id}"),
     ]])
 
-def get_recipients(category=None):
-    """Динамически получает получателей из профилей по роли."""
+def get_recipients(category=None, restaurant=None):
+    """Отримувачі сповіщення за роллю і ЗАКЛАДОМ.
+    Власники + Виконавчий директор (GROUP_ROLES) — усі заклади. Управляючий/Адміністратор —
+    лише свій заклад; якщо для закладу немає жодного — резерв: усі менеджери (щоб задача
+    не лишилась без нагляду). Шеф-повар — кухонні категорії (усі заклади)."""
     recipients = set(OWNER_IDS)
+    venue_match, venue_all = set(), set()
     for uid, p in user_profiles.items():
         if p.get("status") != STATUS_ACTIVE:
             continue
         role = p.get("role", "")
-        if role in ("Управляючий", "Виконавчий директор", "Адміністратор"):
+        if role in GROUP_ROLES or p.get("all_restaurants"):
             recipients.add(uid)
+        elif role in VENUE_ROLES:
+            venue_all.add(uid)
+            if restaurant is None or p.get("restaurant") == restaurant:
+                venue_match.add(uid)
         elif role == "Шеф-повар" and category in KITCHEN_CATEGORIES:
             recipients.add(uid)
+    recipients |= venue_match
+    # Для закладу без свого менеджера НЕ спамимо менеджерів інших закладів (вони все одно
+    # не мають прав діяти — can_act_on_task). Резерв уже є: власники + Виконавчий директор
+    # завжди в отримувачах і завжди можуть діяти. Лише логуємо «безхазяйний» заклад.
+    if restaurant is not None and not venue_match and venue_all:
+        logger.warning(f"No venue manager for '{restaurant}' — covered by owners/exec only")
     return recipients
+
+def visible_restaurants(uid):
+    """Які заклади користувач бачить у дайджесті/переліку (власник/дир. — усі)."""
+    if uid in OWNER_IDS:
+        return set(RESTAURANTS)
+    p = user_profiles.get(uid, {})
+    if p.get("role") in GROUP_ROLES or p.get("all_restaurants"):
+        return set(RESTAURANTS)
+    r = p.get("restaurant")
+    return {r} if r else set(RESTAURANTS)
+
+def can_act_on_task(uid, task_restaurant):
+    """Чи може користувач діяти на задачі цього закладу (кнопки статусу/доручення/коментар)."""
+    if uid in OWNER_IDS:
+        return True
+    p = user_profiles.get(uid, {})
+    if p.get("status") != STATUS_ACTIVE:
+        return False
+    role = p.get("role")
+    if role in GROUP_ROLES or p.get("all_restaurants"):
+        return True
+    if role in VENUE_ROLES:
+        return task_restaurant is None or p.get("restaurant") == task_restaurant
+    return False
 
 def is_admin(user_id):
     if user_id in OWNER_IDS:
@@ -663,22 +711,21 @@ async def ask_restaurant_reg(update, context):
 
 async def notify_admins_new_registration(user_id, profile):
     bot = get_bot()
-    full_name = get_display_name(profile)
+    full_name = md(get_display_name(profile))
     text = (
         f"🆕 *Нова заявка на реєстрацію*\n\n"
-        f"👤 {full_name}\n💼 {profile.get('role')}\n🏠 {profile.get('restaurant')}\n"
-        f"📱 {profile.get('phone', '—')}\n🎂 {profile.get('birthday', '—')}\n📅 {profile.get('start_date', '—')}"
+        f"👤 {full_name}\n💼 {md(profile.get('role'))}\n🏠 {md(profile.get('restaurant'))}\n"
+        f"📱 {md(profile.get('phone', '—'))}\n🎂 {md(profile.get('birthday', '—'))}"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Підтвердити", callback_data=f"approve_{user_id}"),
         InlineKeyboardButton("❌ Відхилити", callback_data=f"reject_{user_id}"),
     ]])
-    for admin_id in get_recipients():
-        try:
-            msg = await bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+    # реєстрацію закладу шлемо менеджерам цього закладу + власникам
+    for admin_id in get_recipients(restaurant=profile.get("restaurant")):
+        msg = await safe_send_message(bot, admin_id, text, reply_markup=keyboard, parse_mode="Markdown")
+        if msg:
             track_msg(admin_id, msg.message_id)
-        except Exception as e:
-            logger.error(f"Notify admin error {admin_id}: {e}")
 
 async def handle_approve(update, context):
     query = update.callback_query
@@ -825,6 +872,14 @@ async def receive_voice(update, context):
         await process_shift_report(update, context)
         return
 
+    # Коментар приймається лише текстом (process_comment читає update.message.text) —
+    # інакше голос у режимі коментаря помилково створив би нову задачу.
+    if context.user_data.get('commenting_on'):
+        msg = await update.message.reply_text("💬 Коментар приймається лише текстом — напишіть його 👇")
+        track_msg(msg.chat_id, msg.message_id)
+        schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
+        return
+
     processing_msg = await update.message.reply_text("🎙 Голосове отримано, обробляю...")
     track_msg(processing_msg.chat_id, processing_msg.message_id)
     schedule_delete(context, _bot, processing_msg.chat_id, processing_msg.message_id, delay=AUTO_DELETE_DELAY)
@@ -848,8 +903,10 @@ async def ask_send_options(update, context):
         [InlineKeyboardButton("📷 Додати фото", callback_data="send_photo")],
     ])
     msg = await update.message.reply_text(
-        "⏱ Автовідправка через 20 сек від вашого імені.\nАбо оберіть варіант:",
-        reply_markup=keyboard
+        "⏱ Автовідправка через 20 сек від вашого імені.\nАбо оберіть варіант:\n"
+        "_🕵️ Анонімно: приховуємо лише ваше ім'я і роль. Заклад і суть керівники бачать "
+        "(кухонні питання бачить і шеф-кухар)._",
+        reply_markup=keyboard, parse_mode="Markdown"
     )
     context.user_data['option_message_id'] = msg.message_id
     context.user_data['option_chat_id'] = msg.chat_id
@@ -1050,31 +1107,59 @@ async def save_photo_to_gdrive(file_id: str, filename: str) -> str:
     return saved_path
 
 
+def _store_task_photo(fid, file_id, path):
+    """Зберігає фото у msgstore без живої відправки (для Низької — щоб дайджест міг показати)."""
+    entry = msg_store.get(fid)
+    if not (isinstance(entry, dict) and "ids" in entry):
+        entry = {"ids": {}, "text": "", "photo": None, "photo_path": ""}
+    entry["photo"] = file_id
+    entry["photo_path"] = path or entry.get("photo_path", "")
+    msg_store[fid] = entry
+    storage.kv_put("msgstore", fid, entry)
+
+
 async def _save_and_notify(results, user_data, profile, photo_file_id, context):
-    """Зберігає фото на диск (раз), створює задачі в таблиці й розсилає сповіщення.
-    Фото-file_id зберігається для КОЖНОЇ підзадачі (щоб дайджест міг його показати),
-    але живе фото шлеться лише для першої. Повертає (categories, feedback_ids)."""
+    """Зберігає фото на диск (раз), створює задачі та (для термінових) розсилає сповіщення.
+    Низька терміновість — БЕЗ реалтайм-пінгу (лише в ранковому зведенні), щоб не перевантажувати.
+    Повертає (categories, feedback_ids, delivery[])."""
     gdrive_path = ""
     if photo_file_id:
         filename = f"feedback_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.jpg"
         gdrive_path = await save_photo_to_gdrive(photo_file_id, filename)
-    categories, ids = [], []
-    for i, result in enumerate(results):
+    categories, ids, delivery = [], [], []
+    first_photo_sent = False
+    for result in results:
         feedback_id = create_task(result, user_data, profile, has_photos=bool(photo_file_id))
-        await send_notifications(result, user_data, profile,
-                                 photo_file_id=photo_file_id, feedback_id=feedback_id, context=context,
-                                 photo_path=gdrive_path, send_live_photo=(i == 0))
+        urgency = result.get("urgency", "Стандартна")
+        realtime = urgency in REALTIME_URGENCY
+        reached = 0
+        if realtime:
+            send_live = bool(photo_file_id) and not first_photo_sent
+            reached = await send_notifications(
+                result, user_data, profile, photo_file_id=photo_file_id, feedback_id=feedback_id,
+                context=context, photo_path=gdrive_path, send_live_photo=send_live) or 0
+            if send_live and reached:
+                first_photo_sent = True
+        elif photo_file_id:
+            _store_task_photo(feedback_id, photo_file_id, gdrive_path)   # для дайджесту
         categories.append(result.get('category', '—'))
         ids.append(feedback_id)
-    return categories, ids
+        delivery.append({"urgency": urgency, "reached": reached, "realtime": realtime})
+    return categories, ids, delivery
 
 
-def _build_confirm_text(results, is_anonymous, photo_file_id, ids):
+def _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery=None):
     anon_note = " (анонімно)" if is_anonymous else ""
     count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
     photo_note = "\n📷 З фото" if photo_file_id else ""
-    warn_note = ("\n⚠️ Тимчасово не збережено в таблицю (показано лише в чаті)."
-                 if any(str(i).startswith("LOCAL-") for i in ids) else "")
+    note = ""
+    if delivery:
+        realtime = [d for d in delivery if d["realtime"]]
+        digestonly = [d for d in delivery if not d["realtime"]]
+        if realtime and all(d["reached"] == 0 for d in realtime):
+            note = "\n⏳ Керівники зараз поза мережею — побачать у зведенні."
+        elif digestonly and not realtime:
+            note = "\n🟢 Зʼявиться у ранковому зведенні керівникам."
     result_lines = []
     for i, r in enumerate(results):
         if i > 0:
@@ -1083,25 +1168,24 @@ def _build_confirm_text(results, is_anonymous, photo_file_id, ids):
         result_lines.append(f"{icon} {r.get('category', '—')} · {r.get('urgency', '—')}")
         result_lines.append(r.get('summary', '—'))
     return (
-        f"✅ Повідомлення надіслано{anon_note}!{count_note}\n\n"
+        f"✅ Повідомлення прийнято{anon_note}!{count_note}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         + "\n".join(result_lines)
-        + f"\n━━━━━━━━━━━━━━━{photo_note}{warn_note}\n\nДякуємо за зворотний зв'язок 🙏"
+        + f"\n━━━━━━━━━━━━━━━{photo_note}{note}\n\nДякуємо за зворотний зв'язок 🙏"
     )
 
 
 async def process_message(query_or_update, context, profile, use_message=False):
-    message_type = context.user_data.get('message_type')
-    pending = context.user_data.get('pending_message')
-    if message_type == 'voice':
-        text = await transcribe_voice(pending)
-    else:
-        text = pending
+    # Атомарне «захоплення» pending_message ДО будь-якого await — щоб автовідправка (20с)
+    # і натискання кнопки не створили дубль задачі: хто другий, той отримає None і вийде.
+    pending = context.user_data.pop('pending_message', None)
+    message_type = context.user_data.pop('message_type', None)
+    if pending is None:
+        return
     target = query_or_update.message
+    text = await transcribe_voice(pending) if message_type == 'voice' else pending
     if not text:
         # Фото НЕ скидаємо — даємо шанс повторити опис; перезапускаємо 2-хв таймер очищення.
-        context.user_data.pop('pending_message', None)
-        context.user_data.pop('message_type', None)
         _uid = profile.get('telegram_id')
         if context.user_data.get('pending_photo') and _uid:
             cancel_user_jobs(context, _uid, "photoclear")
@@ -1114,14 +1198,14 @@ async def process_message(query_or_update, context, profile, use_message=False):
     is_anonymous = context.user_data.get('is_anonymous', False)
 
     results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-    categories, ids = await _save_and_notify(results, context.user_data, profile, photo_file_id, context)
+    categories, ids, delivery = await _save_and_notify(results, context.user_data, profile, photo_file_id, context)
 
-    for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
+    for key in ['waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
         context.user_data.pop(key, None)
 
     _uid = profile.get('telegram_id')
     nudge = _shift_nudge_line() if _should_shift_nudge(_uid) else ""
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids) + nudge
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery) + nudge
     # БЕЗ reply_markup: це підтвердження автовидаляється (нижче). Reply-клавіатура
     # «прив'язана» до останнього повідомлення-носія, тож видалення носія прибрало б
     # постійні кнопки (зокрема «Адмін-меню»). Клавіатура й так живе на /start і в дайджесті.
@@ -1133,15 +1217,13 @@ async def process_message(query_or_update, context, profile, use_message=False):
 
 async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     """Вспомогательная функция для автоотправки (без query объекта)."""
-    message_type = user_data.get('message_type')
-    pending = user_data.get('pending_message')
-    if message_type == 'voice':
-        text = await transcribe_voice(pending)
-    else:
-        text = pending
+    # Атомарне «захоплення» (див. process_message) — проти дубля задачі від кнопки+автовідправки.
+    pending = user_data.pop('pending_message', None)
+    message_type = user_data.pop('message_type', None)
+    if pending is None:
+        return
+    text = await transcribe_voice(pending) if message_type == 'voice' else pending
     if not text:
-        user_data.pop('pending_message', None)
-        user_data.pop('message_type', None)
         if user_data.get('pending_photo') and context:
             cancel_user_jobs(context, user_id, "photoclear")
             context.job_queue.run_once(photo_clear_callback, when=120, name=f"photoclear_{user_id}",
@@ -1153,13 +1235,13 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     is_anonymous = user_data.get('is_anonymous', False)
 
     results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-    categories, ids = await _save_and_notify(results, user_data, profile, photo_file_id, context)
+    categories, ids, delivery = await _save_and_notify(results, user_data, profile, photo_file_id, context)
 
-    for key in ['pending_message', 'message_type', 'pending_photo', 'waiting_for_option', 'waiting_for_photo']:
+    for key in ['waiting_for_option', 'waiting_for_photo']:
         user_data.pop(key, None)
 
     nudge = _shift_nudge_line() if _should_shift_nudge(user_id) else ""
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids) + nudge
+    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery) + nudge
     # БЕЗ reply_markup — див. коментар у process(): носій reply-клавіатури не можна автовидаляти.
     sent = await safe_send_message(bot, chat_id, confirm_text, parse_mode=None)
     if sent:
@@ -1292,7 +1374,7 @@ async def edit_all_messages(bot, feedback_id, new_text, keyboard):
             any_ok = any_ok or ok
     if any_ok and feedback_id in msg_store and isinstance(msg_store[feedback_id], dict):
         msg_store[feedback_id]["text"] = new_text
-        save_msg_store(msg_store)
+        storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
 
 def get_restaurant_prefix(restaurant):
     prefixes = {"Терраса": "T", "Хочу": "H", "Хочу 2.0": "H2"}
@@ -1316,38 +1398,67 @@ def _task_record(rec):
         "Терміновість": rec.get("urgency", "—"),
         "Фото": "є фото" if rec.get("has_photo") else "—",
         "Статус": rec.get("status", "Нове"), "Лог": rec.get("log", "") or "",
+        "_ts": rec.get("created_ts") or "", "_ack": rec.get("acknowledged_at") or "",
+        "_completed": rec.get("completed_date") or "",
     }
+
+def _urg_rank(u):
+    return {"Висока": 0, "Стандартна": 1, "Низька": 2}.get(str(u), 1)
+
+def _task_age_hours(rec):
+    """Вік задачі в годинах (за created_ts, фолбек — created_date+time)."""
+    ts = rec.get("created_ts")
+    try:
+        if ts:
+            dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = datetime.strptime(f"{rec.get('created_date','')} {rec.get('created_time','00:00')}", "%d.%m.%Y %H:%M")
+        return max(0.0, (datetime.now() - dt).total_seconds() / 3600.0)
+    except Exception:
+        return 0.0
 
 def create_task(result, user_data, profile, has_photos=False):
     """СТВОРЮЄ задачу в SQLite (джерело правди) і дзеркалить у Google Sheets (фоном)."""
     restaurant = result.get("restaurant", "Терраса")
     fid = generate_feedback_id(restaurant)
     now = datetime.now()
+    reporter_id = None if user_data.get("is_anonymous") else profile.get("telegram_id")
     rec = {
         "fid": fid,
         "created_date": now.strftime("%d.%m.%Y"), "created_time": now.strftime("%H:%M"),
+        "created_ts": now.strftime("%Y-%m-%d %H:%M:%S"),
         "restaurant": restaurant,
         "sender_name": user_data.get("sender_name", "—"),
         "sender_role": user_data.get("sender_role", "—"),
+        "reporter_id": reporter_id,
         "category": result.get("category", "—"),
         "summary": result.get("summary", "—"),
         "responsible": result.get("responsible", "—"),
         "urgency": result.get("urgency", "—"),
         "has_photo": bool(has_photos),
         "status": "Нове", "log": "",
+        "acknowledged_at": None, "completed_date": None, "escalated": 0, "assignee_id": None,
         "seq": storage.next_seq(),
     }
     tasks_store[fid] = rec
     storage.save_task(rec)
     asyncio.create_task(_mirror_create_to_sheet(rec))
-    logger.info(f"Task created {fid}: {rec['category']} / {rec['urgency']}")
+    logger.info(f"Task created {fid}: {rec['category']} / {rec['urgency']} / {restaurant}")
     return fid
 
 def set_task_status(feedback_id, status):
-    """Оновлює статус задачі в SQLite (джерело правди) + дзеркало в Sheets (фоном)."""
+    """Оновлює статус задачі в SQLite (джерело правди) + дзеркало в Sheets (фоном).
+    Веде acknowledged_at (взято в роботу), completed_date (закрито) і escalated (скидаємо при перевідкритті)."""
     rec = tasks_store.get(feedback_id)
     if rec:
         rec["status"] = status
+        if _is_resolved(status):
+            rec["completed_date"] = datetime.now().strftime("%d.%m.%Y")
+        else:
+            rec["completed_date"] = None          # перевідкрито
+            rec["escalated"] = 0                   # знову можна ескалювати
+        if str(status).startswith("В роботі") and not rec.get("acknowledged_at"):
+            rec["acknowledged_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         storage.save_task(rec)
     asyncio.create_task(_mirror_status_to_sheet(feedback_id, status))
 
@@ -1421,17 +1532,19 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
         id_str = f"`{feedback_id}`" if feedback_id else ""
 
         restaurant = result.get("restaurant", "Терраса")
+        urg = result.get("urgency", "Стандартна")
+        urg_icon = URGENCY_ICONS.get(urg, "")
         text = (
-            f"📌 {id_str} · {md(restaurant)} · {icon} *{md(category)}*\n"
+            f"📌 {id_str} · {md(restaurant)} · {icon} *{md(category)}*{(' ' + urg_icon) if urg_icon else ''}\n"
             f"{md(result.get('summary', '—'))}\n"
             f"_{now.strftime('%d.%m %H:%M')} · {md(sender)}_"
         )
 
         keyboard = build_task_keyboard(safe_id)
-        recipients = get_recipients(category)
+        recipients = get_recipients(category, restaurant)   # маршрут за закладом
         msg_ids = {}
 
-        logger.info(f"Sending notifications: category={category}, recipients={len(recipients)}, photo={'yes' if photo_file_id else 'no'}")
+        logger.info(f"Sending notifications: {feedback_id} {restaurant}/{category}/{urg}, recipients={len(recipients)}, photo={'yes' if photo_file_id else 'no'}")
 
         for uid in recipients:
             msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
@@ -1463,13 +1576,26 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
                 entry["photo"] = photo_file_id
                 entry["photo_path"] = photo_path or entry.get("photo_path", "")
             msg_store[feedback_id] = entry
-            save_msg_store(msg_store)
+            storage.kv_put("msgstore", feedback_id, entry)   # лише один ключ (без перезапису всієї таблиці)
+        return len(msg_ids)
 
     except Exception as e:
         logger.error(f"Notification error: {e}")
+        return 0
 
 
 # ─── СТАТУСИ ЗАДАЧ ────────────────────────────────────────────────────────────
+
+async def _notify_reporter(rec, actor_id, text):
+    """Сповіщає автора задачі про результат (закриття петлі). Поважає анонімність
+    (reporter_id=None для анонімних), не пінгує самого виконавця."""
+    rid = rec.get("reporter_id") if isinstance(rec, dict) else None
+    if not rid or rid == actor_id:
+        return
+    try:
+        await safe_send_message(get_bot(), rid, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"reporter notify failed: {e}")
 
 async def handle_status_update(update, context):
     """Обработчик кнопок статуса на уведомлениях."""
@@ -1486,17 +1612,25 @@ async def handle_status_update(update, context):
     feedback_id = safe_id.replace("_", "-", 2)
 
     user_id = update.effective_user.id
+    rec = tasks_store.get(feedback_id, {})
+    task_restaurant = rec.get("restaurant")
     assigned_info = assign_store.get(feedback_id, {})
-    is_assignee = assigned_info.get("assignee_id") == user_id
+    is_assignee = (assigned_info.get("assignee_id") == user_id
+                   and user_profiles.get(user_id, {}).get("status") == STATUS_ACTIVE)
 
-    if not can_manage_tasks(user_id) and not is_assignee:
-        await safe_answer(query, "Немає прав.", show_alert=True)
+    if not can_act_on_task(user_id, task_restaurant) and not is_assignee:
+        await safe_answer(query, "Немає прав (інший заклад або немає доступу).", show_alert=True)
         return
 
     profile = user_profiles.get(user_id, {})
     who = get_display_name(profile)
     now = datetime.now().strftime("%d.%m %H:%M")
     assigned = feedback_id in assign_store
+
+    # Ідемпотентність: випадковий клік 🔄 на вже закритій задачі не повинен її «перевідкрити»
+    if action == "wip" and _is_resolved(rec.get("status", "")):
+        await safe_answer(query, f"Задачу вже закрито ({rec.get('status','')}).", show_alert=True)
+        return
 
     # ── Видалення задачі (тільки власник) ────────────────────────────────────
     if action == "del":
@@ -1514,12 +1648,13 @@ async def handle_status_update(update, context):
                     pass
         if feedback_id in msg_store:
             del msg_store[feedback_id]
-            save_msg_store(msg_store)
+            storage.kv_delete("msgstore", feedback_id)
         if feedback_id in assign_store:
             assign_store.pop(feedback_id, None)
             save_assign_store(assign_store)
         set_task_status(feedback_id, f"Видалено — {who}")
         add_task_log(feedback_id, f"🗑️ Видалено — {who} {now}")
+        await _notify_reporter(rec, user_id, f"🗑️ Вашу задачу `{feedback_id}` закрито керівником.")
         return
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1557,6 +1692,9 @@ async def handle_status_update(update, context):
     # Оновлюємо задачу в SQLite (джерело правди) + дзеркало в Sheets (фоном)
     set_task_status(feedback_id, sheet_status)
     add_task_log(feedback_id, history_entry)
+    # Закриваємо петлю з автором лише при виконанні (не шумимо на кожен крок)
+    if action == "done":
+        await _notify_reporter(rec, user_id, f"✅ Вашу задачу `{feedback_id}` виконано — {md(who)}")
 
 
 # ─── ДОРУЧЕННЯ (ASSIGN) ───────────────────────────────────────────────────────
@@ -1565,13 +1703,19 @@ async def handle_assign(update, context):
     """Показує список співробітників для доручення."""
     query = update.callback_query
     await safe_answer(query)
-
-    if not can_manage_tasks(update.effective_user.id):
-        await safe_answer(query, "Немає прав.", show_alert=True)
-        return
+    user_id = update.effective_user.id
 
     safe_id = query.data.replace("assign_", "")
     feedback_id = safe_id.replace("_", "-", 2)
+    rec = tasks_store.get(feedback_id, {})
+    if not can_act_on_task(user_id, rec.get("restaurant")):
+        await safe_answer(query, "Немає прав (інший заклад).", show_alert=True)
+        return
+    # скасувати незавершену автовідправку (без знищення чернетки pending_message)
+    cancel_user_jobs(context, user_id, "autosend")
+    cancel_user_jobs(context, user_id, "optdelete")
+    for k in ('waiting_for_option', 'option_message_id', 'option_chat_id'):
+        context.user_data.pop(k, None)
 
     active = [(uid, p) for uid, p in user_profiles.items() if p.get("status") == STATUS_ACTIVE]
     if not active:
@@ -1601,15 +1745,21 @@ async def handle_assign_to(update, context):
     query = update.callback_query
     await safe_answer(query)
 
-    if not can_manage_tasks(update.effective_user.id):
-        await safe_answer(query, "Немає прав.", show_alert=True)
-        return
-
     data = query.data.replace("assignto_", "")
     parts = data.rsplit("_", 1)
     safe_id = parts[0]
     target_uid = int(parts[1])
     feedback_id = safe_id.replace("_", "-", 2)
+
+    if not can_act_on_task(update.effective_user.id, tasks_store.get(feedback_id, {}).get("restaurant")):
+        await safe_answer(query, "Немає прав (інший заклад).", show_alert=True)
+        return
+
+    # денормалізуємо виконавця в задачу (для статистики/ескалації)
+    _arec = tasks_store.get(feedback_id)
+    if _arec:
+        _arec["assignee_id"] = target_uid
+        storage.save_task(_arec)
 
     assigner = user_profiles.get(update.effective_user.id, {})
     assigner_name = get_display_name(assigner)
@@ -1666,7 +1816,7 @@ async def handle_assign_to(update, context):
             msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
         else:
             msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
-        save_msg_store(msg_store)
+        storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
 
     add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
     await query.edit_message_text(f"✅ Завдання `{feedback_id}` доручено *{md(target_name)}*", parse_mode="Markdown")
@@ -1684,6 +1834,22 @@ async def handle_comment(update, context):
     safe_id = query.data.replace("comment_", "")
     feedback_id = safe_id.replace("_", "-", 2)
     user_id = update.effective_user.id
+
+    # Право на коментар: дія в межах закладу або активний виконавець (раніше перевірки не було)
+    rec = tasks_store.get(feedback_id, {})
+    assigned_info = assign_store.get(feedback_id, {})
+    is_assignee = (assigned_info.get("assignee_id") == user_id
+                   and user_profiles.get(user_id, {}).get("status") == STATUS_ACTIVE)
+    if not can_act_on_task(user_id, rec.get("restaurant")) and not is_assignee:
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
+
+    # Скасовуємо незавершену автовідправку (щоб не створила випадкову задачу), але
+    # НЕ знищуємо чернетку (pending_message): лише знімаємо прапорець автовідправки.
+    cancel_user_jobs(context, user_id, "autosend")
+    cancel_user_jobs(context, user_id, "optdelete")
+    for k in ('waiting_for_option', 'option_message_id', 'option_chat_id'):
+        context.user_data.pop(k, None)
 
     cancel_user_jobs(context, user_id, "commentclear")
     # не змішуємо з режимом підсумку зміни
@@ -2144,11 +2310,13 @@ async def handle_report_to_task(update, context):
         await safe_answer(query, "Звіт не знайдено.", show_alert=True)
         return
     await safe_answer(query, "Створюю задачу…")
-    profile = {"restaurant": rec.get("restaurant", "Терраса"), "role": rec.get("sender_role") or "—"}
+    anon = bool(rec.get("is_anonymous"))
+    profile = {"restaurant": rec.get("restaurant", "Терраса"), "role": rec.get("sender_role") or "—",
+               "telegram_id": (None if anon else rec.get("telegram_id"))}
     user_data = {"sender_name": rec.get("sender_name") or "Підсумок зміни",
-                 "sender_role": rec.get("sender_role") or "—"}
-    results = await analyze_with_claude(rec["text"], profile, is_anonymous=bool(rec.get("is_anonymous")))
-    _, ids = await _save_and_notify(results, user_data, profile, None, context)
+                 "sender_role": rec.get("sender_role") or "—", "is_anonymous": anon}
+    results = await analyze_with_claude(rec["text"], profile, is_anonymous=anon)
+    _, ids, _ = await _save_and_notify(results, user_data, profile, None, context)
     # Підтвердження — редагуванням повідомлення (видиме й стійке), кнопку прибираємо.
     base = query.message.text if query.message else ""
     try:
@@ -2212,6 +2380,18 @@ def _photo_deliverable(fid):
     return bool(pp) and os.path.exists(pp)
 
 
+def _row_age_days(row):
+    """Вік задачі в днях (за _ts/created_ts, фолбек — Дата+Час)."""
+    ts = row.get("_ts")
+    try:
+        if ts:
+            dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = datetime.strptime(f"{row.get('Дата','')} {row.get('Час','00:00')}", "%d.%m.%Y %H:%M")
+        return max(0, (datetime.now() - dt).days)
+    except Exception:
+        return 0
+
 def build_row_text(row, fid, safe_id):
     """Формує текст і клавіатуру для рядка задачі з таблиці."""
     status = str(row.get("Статус", "Нове"))
@@ -2231,9 +2411,14 @@ def build_row_text(row, fid, safe_id):
     assigned = fid in assign_store
     assign_info = assign_store.get(fid, {})
     photo_mark = " 📷" if has_photo else ""
+    urg_icon = URGENCY_ICONS.get(str(row.get("Терміновість", "")), "")
+    age = _row_age_days(row)
+    extra = (" " + urg_icon if urg_icon else "") + (f" ⏰{age}д" if age >= 2 else "")
+    if not assigned and status.startswith("Нове"):
+        extra += " ⚠️без власника"
 
     text = (
-        f"{status_icon} `{fid}` · {cat_icon} *{md(category)}*{photo_mark}\n"
+        f"{status_icon} `{fid}` · {cat_icon} *{md(category)}*{photo_mark}{extra}\n"
         f"{md(summary)}\n"
         f"_{md(date_str)} · {md(sender)}_"
     )
@@ -2255,90 +2440,92 @@ async def send_unresolved_digest(context):
     """
     try:
         bot = get_bot()
-        # Джерело правди — SQLite (tasks_store). Найновіші згори (за seq).
-        rows = [_task_record(r) for _, r in
-                sorted(tasks_store.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)]
-
         recipients = list(get_recipients())
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
+        all_rows = [_task_record(r) for _, r in tasks_store.items() if str(r.get("fid", "")).strip()]
 
-        unresolved = [r for r in rows
-                      if str(r.get("Номер", "")).strip() and not _is_resolved(r.get("Статус", ""))]
-        completed_yesterday = [
-            r for r in rows
-            if str(r.get("Номер", "")).strip()
-            and str(r.get("Статус", "")).strip().startswith("Виконано")
-            and r.get("Дата", "") == yesterday
-        ]
-
-        # ── 1. Очищення чату ──────────────────────────────────────────────────
+        # ── 1. Очищення чату всім отримувачам ─────────────────────────────────
         await delete_tracked_messages(bot, recipients)
 
-        # ── 2. Виконані вчора ─────────────────────────────────────────────────
-        if completed_yesterday:
-            done_text = f"✅ *Виконано вчора ({yesterday}): {len(completed_yesterday)}*\n\n"
-            for row in completed_yesterday:
-                fid = row.get("Номер", "—")
-                category = row.get("Категорія", "—")
-                cat_icon = CATEGORY_ICONS.get(category, "📌")
-                summary = row.get("Суть", "—")
-                status = row.get("Статус", "—")
-                done_text += f"✅ `{fid}` · {cat_icon} {md(summary)}\n_{md(status)}_\n\n"
-            for uid in recipients:
-                msg = await safe_send_message(bot, uid, done_text.strip(), reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
-                if msg:
-                    track_msg(uid, msg.message_id)
-        else:
-            for uid in recipients:
-                msg = await safe_send_message(bot, uid, f"✅ *Вчора ({yesterday}) виконаних завдань немає.*",
-                                              reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
-                if msg:
-                    track_msg(uid, msg.message_id)
+        # ── 2.5 Підсумки змін (агреговано) — захищено, щоб збій не зірвав дайджест ──
+        try:
+            await send_shift_reports_section(bot, recipients, context)
+            _purge_old_shift_reports()
+        except Exception as e:
+            logger.error(f"Digest shift section error: {e}")
 
-        # ── 2.5 Підсумки змін за вчора (агрегована Claude-сводка; тихий день — нічого) ──
-        await send_shift_reports_section(bot, recipients, context)
-        _purge_old_shift_reports()
-
-        # ── 3. Невиконані завдання ────────────────────────────────────────────
-        if not unresolved:
-            for uid in recipients:
-                msg = await safe_send_message(bot, uid, "🎉 *Всі завдання виконано!*",
-                                              reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
-                if msg:
-                    track_msg(uid, msg.message_id)
-            return
-
-        header = f"🔴 *Невиконані завдання: {len(unresolved)}*"
+        # ── Персонально кожному: лише його заклади, відсортовано за терміновістю+віком ──
         for uid in recipients:
-            msg = await safe_send_message(bot, uid, header, parse_mode="Markdown")
-            if msg:
-                track_msg(uid, msg.message_id)
+            venues = visible_restaurants(uid)
+            mine = all_rows if venues == set(RESTAURANTS) else [r for r in all_rows if r.get("Заклад") in venues]
+            unresolved = [r for r in mine if not _is_resolved(r.get("Статус", ""))]
+            completed = [r for r in mine if str(r.get("Статус", "")).strip().startswith("Виконано")
+                         and r.get("_completed") == yesterday]
+            multi_venue = (venues == set(RESTAURANTS)) or len(venues) > 1
+            # Сортуємо: при кількох закладах — спершу за закладом (для груп. заголовків), тоді терміновість+вік
+            if multi_venue:
+                unresolved.sort(key=lambda r: (r.get("Заклад", ""), _urg_rank(r.get("Терміновість", "")), -_row_age_days(r)))
+            else:
+                unresolved.sort(key=lambda r: (_urg_rank(r.get("Терміновість", "")), -_row_age_days(r)))
 
-        for row in unresolved:
-            fid = row.get("Номер", "—")
-            safe_id = fid.replace("-", "_")
-            _, keyboard = build_row_text(row, fid, safe_id)
-            raw = msg_store.get(fid)
-            stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
-            stored_photo = raw.get("photo") if isinstance(raw, dict) else None
-            stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
-            text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
-            for uid in recipients:
-                msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
-                if msg is None:
-                    continue
-                track_msg(uid, msg.message_id)
-                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
-                if stored_photo:
-                    photo_msg = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
-                    if photo_msg is not None:
-                        track_msg(uid, photo_msg.message_id)
-                        schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
-                _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
-                await asyncio.sleep(0.03)  # делікатний темп, щоб не впертись у flood-control
-            if fid != "—":
-                save_msg_store(msg_store)
+            # Виконано вчора
+            if completed:
+                dt = f"✅ *Виконано вчора ({yesterday}): {len(completed)}*\n\n"
+                for row in completed:
+                    ci = CATEGORY_ICONS.get(row.get("Категорія", "—"), "📌")
+                    dt += f"✅ `{row.get('Номер','—')}` · {ci} {md(row.get('Суть','—'))}\n"
+                m = await safe_send_message(bot, uid, dt.strip(), reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+            else:
+                m = await safe_send_message(bot, uid, f"✅ *Вчора ({yesterday}) виконаних завдань немає.*",
+                                            reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+            if m:
+                track_msg(uid, m.message_id)
 
+            if not unresolved:
+                m = await safe_send_message(bot, uid, "🎉 *Всі завдання виконано!*",
+                                            reply_markup=get_main_keyboard(uid), parse_mode="Markdown")
+                if m:
+                    track_msg(uid, m.message_id)
+                continue
+
+            m = await safe_send_message(bot, uid, f"🔴 *Невиконані завдання: {len(unresolved)}*", parse_mode="Markdown")
+            if m:
+                track_msg(uid, m.message_id)
+
+            cur_venue = None
+            for row in unresolved:
+                try:
+                    fid = row.get("Номер", "—")
+                    safe_id = fid.replace("-", "_")
+                    if multi_venue and row.get("Заклад") != cur_venue:
+                        cur_venue = row.get("Заклад")
+                        hv = await safe_send_message(bot, uid, f"🏠 *{md(cur_venue or '—')}*", parse_mode="Markdown")
+                        if hv:
+                            track_msg(uid, hv.message_id)
+                    _, keyboard = build_row_text(row, fid, safe_id)
+                    raw = msg_store.get(fid)
+                    stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
+                    stored_photo = raw.get("photo") if isinstance(raw, dict) else None
+                    stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
+                    text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
+                    msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
+                    if msg is None:
+                        continue
+                    track_msg(uid, msg.message_id)
+                    schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
+                    if stored_photo:
+                        pm = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
+                        if pm is not None:
+                            track_msg(uid, pm.message_id)
+                            schedule_delete(context, bot, uid, pm.message_id, delay=TASK_DELETE_DELAY)
+                    _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
+                    if fid != "—":
+                        storage.kv_put("msgstore", fid, msg_store[fid])
+                    await asyncio.sleep(0.03)
+                except Exception as e:
+                    logger.error(f"Digest item {row.get('Номер')} for {uid}: {e}")
+
+        storage.meta_set("last_digest", datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
         logger.error(f"Unresolved digest error: {e}")
 
@@ -2349,18 +2536,13 @@ async def send_birthday_greetings(context):
         birthday_users = [(uid, p) for uid, p in user_profiles.items()
                           if p.get("status") == STATUS_ACTIVE and p.get("birthday", "")[:5] == today]
         for uid, profile in birthday_users:
-            try:
-                await bot.send_message(chat_id=uid, text=f"🎂 З Днем народження, {profile.get('first_name', '')}! 🎉\nВітаємо від усієї команди! Бажаємо здоров'я та успіхів! 🥳")
-            except Exception as e:
-                logger.error(f"Birthday error {uid}: {e}")
+            await safe_send_message(bot, uid, f"🎂 З Днем народження, {profile.get('first_name', '')}! 🎉\nВітаємо від усієї команди! Бажаємо здоров'я та успіхів! 🥳", parse_mode=None)
         if birthday_users:
-            names = ", ".join(get_display_name(p) for _, p in birthday_users)
+            names = ", ".join(md(get_display_name(p)) for _, p in birthday_users)
             for admin_id in get_recipients():
-                try:
-                    msg = await bot.send_message(chat_id=admin_id, text=f"🎂 Сьогодні день народження у: *{names}*", parse_mode="Markdown")
+                msg = await safe_send_message(bot, admin_id, f"🎂 Сьогодні день народження у: *{names}*", parse_mode="Markdown")
+                if msg:
                     track_msg(admin_id, msg.message_id)
-                except Exception as e:
-                    logger.error(f"Birthday admin error: {e}")
     except Exception as e:
         logger.error(f"Birthday greetings error: {e}")
 
@@ -2693,10 +2875,16 @@ async def show_unresolved(query, context):
     uid = query.from_user.id
     bot = get_bot()
     try:
-        rows = [_task_record(r) for _, r in
-                sorted(tasks_store.items(), key=lambda kv: kv[1].get("seq", 0), reverse=True)]
-        unresolved = [r for r in rows
-                      if str(r.get("Номер", "")).strip() and not _is_resolved(r.get("Статус", ""))]
+        venues = visible_restaurants(uid)
+        rows = [_task_record(r) for _, r in tasks_store.items() if str(r.get("fid", "")).strip()]
+        if venues != set(RESTAURANTS):
+            rows = [r for r in rows if r.get("Заклад") in venues]
+        unresolved = [r for r in rows if not _is_resolved(r.get("Статус", ""))]
+        multi_venue = (venues == set(RESTAURANTS)) or len(venues) > 1
+        if multi_venue:
+            unresolved.sort(key=lambda r: (r.get("Заклад", ""), _urg_rank(r.get("Терміновість", "")), -_row_age_days(r)))
+        else:
+            unresolved.sort(key=lambda r: (_urg_rank(r.get("Терміновість", "")), -_row_age_days(r)))
 
         if not unresolved:
             await query.edit_message_text(
@@ -2713,29 +2901,38 @@ async def show_unresolved(query, context):
         if header:
             track_msg(uid, header.message_id)
 
+        cur_venue = None
         for row in unresolved:
-            fid = row.get("Номер", "—")
-            safe_id = fid.replace("-", "_")
-            _, keyboard = build_row_text(row, fid, safe_id)
-            raw = msg_store.get(fid)
-            stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
-            stored_photo = raw.get("photo") if isinstance(raw, dict) else None
-            stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
-            text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
-            msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
-            if msg is None:
-                continue
-            track_msg(uid, msg.message_id)
-            schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
-            if stored_photo:
-                photo_msg = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
-                if photo_msg is not None:
-                    track_msg(uid, photo_msg.message_id)
-                    schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
-            _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
-            if fid != "—":
-                save_msg_store(msg_store)
-            await asyncio.sleep(0.03)
+            try:
+                fid = row.get("Номер", "—")
+                safe_id = fid.replace("-", "_")
+                if multi_venue and row.get("Заклад") != cur_venue:
+                    cur_venue = row.get("Заклад")
+                    hv = await safe_send_message(bot, uid, f"🏠 *{md(cur_venue or '—')}*", parse_mode="Markdown")
+                    if hv:
+                        track_msg(uid, hv.message_id)
+                _, keyboard = build_row_text(row, fid, safe_id)
+                raw = msg_store.get(fid)
+                stored_text = raw.get("text", "") if isinstance(raw, dict) else ""
+                stored_photo = raw.get("photo") if isinstance(raw, dict) else None
+                stored_photo_path = raw.get("photo_path", "") if isinstance(raw, dict) else ""
+                text = stored_text if stored_text else build_row_text(row, fid, safe_id)[0]
+                msg = await safe_send_message(bot, uid, text, reply_markup=keyboard, parse_mode="Markdown")
+                if msg is None:
+                    continue
+                track_msg(uid, msg.message_id)
+                schedule_delete(context, bot, uid, msg.message_id, delay=TASK_DELETE_DELAY)
+                if stored_photo:
+                    photo_msg = await safe_send_photo(bot, uid, file_id=stored_photo, file_path=stored_photo_path)
+                    if photo_msg is not None:
+                        track_msg(uid, photo_msg.message_id)
+                        schedule_delete(context, bot, uid, photo_msg.message_id, delay=TASK_DELETE_DELAY)
+                _store_task_message(fid, uid, msg.message_id, text, photo=stored_photo, photo_path=stored_photo_path)
+                if fid != "—":
+                    storage.kv_put("msgstore", fid, msg_store[fid])
+                await asyncio.sleep(0.03)
+            except Exception as e:
+                logger.error(f"Unresolved item {row.get('Номер')} for {uid}: {e}")
 
     except Exception as e:
         logger.error(f"Show unresolved error: {e}")
@@ -2816,13 +3013,15 @@ async def handle_fire(update, context):
     if user_id in user_profiles:
         user_profiles[user_id]["status"] = STATUS_FIRED
         save_profiles(user_profiles)
+        # прибираємо доручення на звільненого, щоб він не міг діяти на старих задачах
+        removed = [fid for fid, info in list(assign_store.items()) if info.get("assignee_id") == user_id]
+        for fid in removed:
+            assign_store.pop(fid, None)
+        if removed:
+            save_assign_store(assign_store)
         full_name = get_display_name(user_profiles[user_id])
         await query.edit_message_text(f"✅ {full_name} — звільнено.")
-        bot = get_bot()
-        try:
-            await bot.send_message(chat_id=user_id, text="❌ Ваш доступ до бота відхилено керівником.")
-        except Exception as e:
-            logger.error(f"Fire error: {e}")
+        await safe_send_message(get_bot(), user_id, "❌ Ваш доступ до бота відхилено керівником.", parse_mode=None)
 
 async def show_profile(update, context):
     user_id = update.effective_user.id
@@ -3027,6 +3226,75 @@ async def _post_init(app):
         logger.error(f"post_init tasks load error: {e}")
 
 
+def _result_from_rec(rec):
+    return {"category": rec.get("category", "—"), "summary": rec.get("summary", "—"),
+            "restaurant": rec.get("restaurant", "Терраса"), "urgency": rec.get("urgency", "Стандартна"),
+            "responsible": rec.get("responsible", "—")}
+
+async def sla_sweep(context):
+    """Періодично: (1) дослати термінові задачі без живої копії (недоставлені);
+    (2) ескалювати власнику прострочені термінові без реакції. Тихо, поки нічого не зривається."""
+    try:
+        bot = get_bot()
+        for fid, rec in list(tasks_store.items()):
+            if _is_resolved(rec.get("status", "")):
+                continue
+            urg = rec.get("urgency", "Стандартна")
+            entry = msg_store.get(fid)
+            live = bool(isinstance(entry, dict) and entry.get("ids"))
+            if urg in REALTIME_URGENCY and not live:   # недоставлена термінова → дослати
+                ud = {"sender_name": rec.get("sender_name", "—"), "sender_role": rec.get("sender_role", "—")}
+                await send_notifications(_result_from_rec(rec), ud, {"restaurant": rec.get("restaurant")},
+                    photo_file_id=(entry or {}).get("photo"), feedback_id=fid, context=context,
+                    photo_path=(entry or {}).get("photo_path", ""), send_live_photo=False)
+            if (urg in ESCALATE_URGENCY and rec.get("created_ts")   # лише задачі, створені вже з трекінгом
+                    and not rec.get("acknowledged_at")
+                    and not rec.get("escalated") and _task_age_hours(rec) >= SLA_HOURS.get(urg, 24)):
+                for oid in OWNER_IDS:
+                    await safe_send_message(bot, oid,
+                        f"⏰ Прострочено (термінова, ~{int(_task_age_hours(rec))}год без реакції):\n"
+                        f"`{fid}` · {md(rec.get('restaurant',''))} · {md(rec.get('summary',''))}",
+                        parse_mode="Markdown")
+                rec["escalated"] = 1
+                storage.save_task(rec)
+    except Exception as e:
+        logger.error(f"SLA sweep error: {e}")
+
+async def daily_backup(context):
+    """Щоденний узгоджений бекап feedback.db на E: і G: з ротацією (3-2-1)."""
+    try:
+        await _arun(storage.checkpoint)
+    except Exception:
+        pass
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    made = []
+    for d in BACKUP_DIRS:
+        try:
+            os.makedirs(d, exist_ok=True)
+            dest = os.path.join(d, f"feedback_{stamp}.db")
+            await _arun(lambda dest=dest: storage.backup_to(dest))
+            if await _arun(lambda dest=dest: storage.integrity_ok(dest)):
+                made.append(dest)
+                files = sorted(f for f in os.listdir(d) if f.startswith("feedback_") and f.endswith(".db"))
+                for old in files[:-BACKUP_RETENTION]:
+                    try:
+                        os.remove(os.path.join(d, old))
+                    except Exception:
+                        pass
+            else:
+                logger.error(f"Backup integrity failed: {dest}")
+        except Exception as e:
+            logger.error(f"Backup to {d} failed: {e}")
+    if made:
+        logger.info(f"DB backup ok ({len(made)} dest)")
+    elif OWNER_IDS:
+        await safe_send_message(get_bot(), OWNER_IDS[0], "⚠️ Не вдалося зробити бекап БД сьогодні.", parse_mode=None)
+
+async def checkpoint_job(context):
+    """Періодично зливає WAL у основний файл (щоб дані не накопичувались лише у WAL)."""
+    await _arun(storage.checkpoint)
+
+
 def main():
     global application
     asyncio.set_event_loop(asyncio.new_event_loop())
@@ -3067,6 +3335,9 @@ def main():
     job_queue = app.job_queue
     job_queue.run_daily(send_unresolved_digest, time=datetime.strptime("06:00", "%H:%M").time())
     job_queue.run_daily(send_birthday_greetings, time=datetime.strptime("06:00", "%H:%M").time())
+    job_queue.run_daily(daily_backup, time=datetime.strptime("05:30", "%H:%M").time())   # бекап БД
+    job_queue.run_repeating(sla_sweep, interval=1800, first=300)        # ескалація/недоставлені, кожні 30 хв
+    job_queue.run_repeating(checkpoint_job, interval=600, first=600)    # WAL checkpoint, кожні 10 хв
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -3116,7 +3387,10 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущено...")
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        storage.close()   # зливаємо WAL у основний файл при коректній зупинці
 
 if __name__ == "__main__":
     main()
