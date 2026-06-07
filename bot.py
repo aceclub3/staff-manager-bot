@@ -1598,67 +1598,46 @@ async def _notify_reporter(rec, actor_id, text):
     except Exception as e:
         logger.error(f"reporter notify failed: {e}")
 
-async def handle_status_update(update, context):
-    """Обработчик кнопок статуса на уведомлениях."""
-    query = update.callback_query
-    await safe_answer(query)
 
-    parts = query.data.split("_", 2)
-    if len(parts) < 3:
-        await safe_answer(query, "Невірний формат.", show_alert=True)
-        return
+# ─── ЯДРО ДІЙ НАД ЗАДАЧЕЮ (спільне для кнопок чату і дашборду «Пульт керівника») ──
+# Ці корутини НЕ залежать від telegram Update/CallbackQuery — приймають лише прості
+# аргументи. Завдяки цьому дашборд (webapp_api) виконує ТОЧНО ті самі дії, що й кнопки
+# в чаті: edit_all_messages оновлює текст у всіх отримувачів, _notify_reporter закриває
+# петлю з автором, дзеркало в Sheets пишеться — без дублювання логіки й розсинхрону.
+# Повертають dict {ok: bool, error?: str, ...}. Перевірку прав/ідемпотентності роблять
+# усередині, тож і кнопка, і дашборд гейтяться однаково.
 
-    action = parts[1]
-    safe_id = parts[2]
-    feedback_id = safe_id.replace("_", "-", 2)
-
-    user_id = update.effective_user.id
+def _fallback_task_text(feedback_id):
+    """Базовий текст задачі, коли в msgstore немає збереженого (рідко: дія по старій
+    задачі без живої копії). Формат як у send_notifications."""
     rec = tasks_store.get(feedback_id, {})
-    task_restaurant = rec.get("restaurant")
-    assigned_info = assign_store.get(feedback_id, {})
-    is_assignee = (assigned_info.get("assignee_id") == user_id
-                   and user_profiles.get(user_id, {}).get("status") == STATUS_ACTIVE)
+    if not rec:
+        return ""
+    category = rec.get("category", "—")
+    icon = CATEGORY_ICONS.get(category, "📌")
+    urg = rec.get("urgency", "Стандартна")
+    urg_icon = URGENCY_ICONS.get(urg, "")
+    return (f"📌 `{feedback_id}` · {md(rec.get('restaurant',''))} · {icon} *{md(category)}*"
+            f"{(' ' + urg_icon) if urg_icon else ''}\n{md(rec.get('summary','—'))}")
 
-    if not can_act_on_task(user_id, task_restaurant) and not is_assignee:
-        await safe_answer(query, "Немає прав (інший заклад або немає доступу).", show_alert=True)
-        return
+def _is_task_assignee(feedback_id, user_id):
+    """Активний виконавець цієї задачі (має права на її кнопки попри інший заклад)."""
+    info = assign_store.get(feedback_id, {})
+    return (info.get("assignee_id") == user_id
+            and user_profiles.get(user_id, {}).get("status") == STATUS_ACTIVE)
 
-    profile = user_profiles.get(user_id, {})
+async def task_action_status(feedback_id, action, actor_id, fallback_text=None):
+    """done / wip / cancel. Перевіряє права та ідемпотентність. {ok, error?, status?}."""
+    rec = tasks_store.get(feedback_id, {})
+    if not can_act_on_task(actor_id, rec.get("restaurant")) and not _is_task_assignee(feedback_id, actor_id):
+        return {"ok": False, "error": "no_perm"}
+    if action == "wip" and _is_resolved(rec.get("status", "")):
+        return {"ok": False, "error": "already_closed", "status": rec.get("status", "")}
+    profile = user_profiles.get(actor_id, {})
     who = get_display_name(profile)
     now = datetime.now().strftime("%d.%m %H:%M")
     assigned = feedback_id in assign_store
-
-    # Ідемпотентність: випадковий клік 🔄 на вже закритій задачі не повинен її «перевідкрити»
-    if action == "wip" and _is_resolved(rec.get("status", "")):
-        await safe_answer(query, f"Задачу вже закрито ({rec.get('status','')}).", show_alert=True)
-        return
-
-    # ── Видалення задачі (тільки власник) ────────────────────────────────────
-    if action == "del":
-        if not is_owner(user_id):
-            await safe_answer(query, "Тільки власник може видаляти.", show_alert=True)
-            return
-        bot = get_bot()
-        msg_ids, _ = get_msg_data(feedback_id)
-        for uid_str, mid in list(msg_ids.items()):
-            ids = mid if isinstance(mid, list) else [mid]
-            for m in ids:
-                try:
-                    await bot.delete_message(chat_id=int(uid_str), message_id=m)
-                except Exception:
-                    pass
-        if feedback_id in msg_store:
-            del msg_store[feedback_id]
-            storage.kv_delete("msgstore", feedback_id)
-        if feedback_id in assign_store:
-            assign_store.pop(feedback_id, None)
-            save_assign_store(assign_store)
-        set_task_status(feedback_id, f"Видалено — {who}")
-        add_task_log(feedback_id, f"🗑️ Видалено — {who} {now}")
-        await _notify_reporter(rec, user_id, f"🗑️ Вашу задачу `{feedback_id}` закрито керівником.")
-        return
-    # ─────────────────────────────────────────────────────────────────────────
-
+    safe_id = feedback_id.replace("-", "_")
     if action == "done":
         status_text = f"✅ Виконано — {md(who)} {now}"
         new_keyboard = build_task_keyboard(safe_id, assigned=assigned, done=True)
@@ -1673,29 +1652,173 @@ async def handle_status_update(update, context):
         new_keyboard = build_wip_keyboard(safe_id, assigned=assigned)
         sheet_status = f"В роботі — {who}"
         history_entry = f"🔄 В роботі — {who} {now}"
-    else:  # cancel
+    elif action == "cancel":
         status_text = f"↩️ Скасовано — {md(who)} {now}"
         new_keyboard = build_task_keyboard(safe_id, assigned=assigned)
         sheet_status = "Нове"
         history_entry = f"↩️ Скасовано — {who} {now}"
-
+    else:
+        return {"ok": False, "error": "bad_action"}
     _, stored_text = get_msg_data(feedback_id)
-    base_text = stored_text if stored_text else query.message.text
+    base_text = stored_text if stored_text else (fallback_text or _fallback_task_text(feedback_id))
     # прибираємо лише попередні СТАТУСНІ рядки (за повним префіксом бота),
     # щоб випадково не вирізати опис, який міг початись з ✅/🔄/↩️
     status_prefixes = ("✅ Виконано", "🔄 В роботі", "↩️ Скасовано")
     base_lines = [l for l in base_text.split("\n") if not l.lstrip().startswith(status_prefixes)]
     new_text = "\n".join(base_lines).rstrip() + f"\n{status_text}"
-
     bot = get_bot()
-    # Спочатку редагуємо повідомлення — миттєво для користувача
     await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
-    # Оновлюємо задачу в SQLite (джерело правди) + дзеркало в Sheets (фоном)
     set_task_status(feedback_id, sheet_status)
     add_task_log(feedback_id, history_entry)
-    # Закриваємо петлю з автором лише при виконанні (не шумимо на кожен крок)
     if action == "done":
-        await _notify_reporter(rec, user_id, f"✅ Вашу задачу `{feedback_id}` виконано — {md(who)}")
+        await _notify_reporter(rec, actor_id, f"✅ Вашу задачу `{feedback_id}` виконано — {md(who)}")
+    return {"ok": True, "status_text": status_text}
+
+async def task_action_delete(feedback_id, actor_id):
+    """Видалення задачі (лише власник): прибирає живі повідомлення, чистить кеші, закриває петлю."""
+    if not is_owner(actor_id):
+        return {"ok": False, "error": "owner_only"}
+    rec = tasks_store.get(feedback_id, {})
+    who = get_display_name(user_profiles.get(actor_id, {}))
+    now = datetime.now().strftime("%d.%m %H:%M")
+    bot = get_bot()
+    msg_ids, _ = get_msg_data(feedback_id)
+    for uid_str, mid in list(msg_ids.items()):
+        ids = mid if isinstance(mid, list) else [mid]
+        for m in ids:
+            try:
+                await bot.delete_message(chat_id=int(uid_str), message_id=m)
+            except Exception:
+                pass
+    if feedback_id in msg_store:
+        del msg_store[feedback_id]
+        storage.kv_delete("msgstore", feedback_id)
+    if feedback_id in assign_store:
+        assign_store.pop(feedback_id, None)
+        save_assign_store(assign_store)
+    set_task_status(feedback_id, f"Видалено — {who}")
+    add_task_log(feedback_id, f"🗑️ Видалено — {who} {now}")
+    await _notify_reporter(rec, actor_id, f"🗑️ Вашу задачу `{feedback_id}` закрито керівником.")
+    return {"ok": True}
+
+async def task_action_comment(feedback_id, actor_id, comment_text):
+    """Дописує коментар у задачу (перевірка прав; для кнопки і дашборду)."""
+    rec = tasks_store.get(feedback_id, {})
+    if not can_act_on_task(actor_id, rec.get("restaurant")) and not _is_task_assignee(feedback_id, actor_id):
+        return {"ok": False, "error": "no_perm"}
+    comment_text = (comment_text or "").strip()
+    if not comment_text:
+        return {"ok": False, "error": "empty"}
+    who = get_display_name(user_profiles.get(actor_id, {}))
+    now = datetime.now().strftime("%d.%m %H:%M")
+    comment_line_raw = f"💬 {who} {now}: {comment_text}"          # для таблиці (без екранування)
+    comment_line = f"💬 {md(who)} {now}: {md(comment_text)}"      # для показу в Telegram
+    _, stored_text = get_msg_data(feedback_id)
+    new_text = (stored_text + f"\n{comment_line}") if stored_text else comment_line
+    assigned = feedback_id in assign_store
+    safe_id = feedback_id.replace("-", "_")
+    keyboard = build_task_keyboard(safe_id, assigned=assigned)
+    bot = get_bot()
+    await edit_all_messages(bot, feedback_id, new_text, keyboard)
+    add_task_log(feedback_id, comment_line_raw)
+    return {"ok": True}
+
+async def task_action_assign(feedback_id, target_uid, actor_id, context=None, fallback_text=None):
+    """Доручає задачу target_uid (перевірка прав). Спільне для кнопки і дашборду.
+    context — опц. (для автовидалення повідомлень); кнопковий хендлер сам показує підтвердження."""
+    rec = tasks_store.get(feedback_id, {})
+    if not can_act_on_task(actor_id, rec.get("restaurant")):
+        return {"ok": False, "error": "no_perm"}
+    target_profile = user_profiles.get(target_uid)
+    if not target_profile or target_profile.get("status") != STATUS_ACTIVE:
+        return {"ok": False, "error": "bad_target"}
+    safe_id = feedback_id.replace("-", "_")
+    # денормалізуємо виконавця в задачу (для статистики/ескалації)
+    if rec:
+        rec["assignee_id"] = target_uid
+        storage.save_task(rec)
+    assigner_name = get_display_name(user_profiles.get(actor_id, {}))
+    target_name = get_display_name(target_profile)
+    now = datetime.now().strftime("%d.%m %H:%M")
+    bot = get_bot()
+    old = assign_store.get(feedback_id)
+    if old and old.get("assignee_id") != target_uid:
+        reassigned_msg = await safe_send_message(
+            bot, old["assignee_id"],
+            f"❌ Завдання `{feedback_id}` передоручено іншому співробітнику.",
+            parse_mode="Markdown")
+        if reassigned_msg is not None:
+            track_msg(old["assignee_id"], reassigned_msg.message_id)
+            if context and getattr(context, "job_queue", None):
+                schedule_delete(context, bot, old["assignee_id"], reassigned_msg.message_id, delay=AUTO_DELETE_DELAY)
+    assign_store[feedback_id] = {
+        "assignee_id": target_uid, "assignee_name": target_name,
+        "assigned_by": assigner_name, "assigned_at": now,
+    }
+    save_assign_store(assign_store)
+    assign_line = f"\n👤 Доручено: {md(target_name)} — {md(assigner_name)} {now}"
+    _, stored_text = get_msg_data(feedback_id)
+    base_text = stored_text if stored_text else (fallback_text or _fallback_task_text(feedback_id))
+    lines = [l for l in base_text.split("\n") if not l.startswith("👤 Доручено:")]
+    new_text = "\n".join(lines) + assign_line
+    new_keyboard = build_task_keyboard(safe_id, assigned=True)
+    await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
+    # окреме повідомлення виконавцю (без статусів/доручення в тексті)
+    _, stored2 = get_msg_data(feedback_id)
+    base2 = stored2 if stored2 else (fallback_text or _fallback_task_text(feedback_id))
+    task_lines = [l for l in base2.split("\n") if not l.startswith(("✅", "🔄", "↩️", "👤 Доручено:"))]
+    task_text = "\n".join(task_lines).strip()
+    assignee_keyboard = build_task_keyboard(safe_id)
+    msg = await safe_send_message(
+        bot, target_uid,
+        f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {md(assigner_name)} {now}_",
+        reply_markup=assignee_keyboard, parse_mode="Markdown")
+    if msg is not None:
+        track_msg(target_uid, msg.message_id)
+        if context and getattr(context, "job_queue", None):
+            schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
+        if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict) and "ids" in msg_store[feedback_id]:
+            msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
+        else:
+            msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
+        storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
+    add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
+    return {"ok": True, "target_name": target_name}
+
+
+async def handle_status_update(update, context):
+    """Обработчик кнопок статуса на уведомлениях."""
+    query = update.callback_query
+    await safe_answer(query)
+
+    parts = query.data.split("_", 2)
+    if len(parts) < 3:
+        await safe_answer(query, "Невірний формат.", show_alert=True)
+        return
+
+    action = parts[1]
+    safe_id = parts[2]
+    feedback_id = safe_id.replace("_", "-", 2)
+    user_id = update.effective_user.id
+
+    # Видалення (лише власник) — окрема корутина (прибирає живі повідомлення).
+    if action == "del":
+        res = await task_action_delete(feedback_id, user_id)
+        if not res.get("ok"):
+            await safe_answer(query, "Тільки власник може видаляти.", show_alert=True)
+        return
+
+    # done / wip / cancel — спільне ядро (та сама логіка, що й у дашборді).
+    res = await task_action_status(feedback_id, action, user_id,
+                                   fallback_text=(query.message.text if query.message else None))
+    if not res.get("ok"):
+        err = res.get("error")
+        if err == "already_closed":
+            await safe_answer(query, f"Задачу вже закрито ({res.get('status','')}).", show_alert=True)
+        elif err == "no_perm":
+            await safe_answer(query, "Немає прав (інший заклад або немає доступу).", show_alert=True)
+        else:
+            await safe_answer(query, "Невірна дія.", show_alert=True)
 
 
 # ─── ДОРУЧЕННЯ (ASSIGN) ───────────────────────────────────────────────────────
@@ -1752,75 +1875,19 @@ async def handle_assign_to(update, context):
     target_uid = int(parts[1])
     feedback_id = safe_id.replace("_", "-", 2)
 
-    if not can_act_on_task(update.effective_user.id, tasks_store.get(feedback_id, {}).get("restaurant")):
-        await safe_answer(query, "Немає прав (інший заклад).", show_alert=True)
+    res = await task_action_assign(feedback_id, target_uid, update.effective_user.id,
+                                   context=context,
+                                   fallback_text=(query.message.text if query.message else None))
+    if not res.get("ok"):
+        if res.get("error") == "no_perm":
+            await safe_answer(query, "Немає прав (інший заклад).", show_alert=True)
+        else:
+            await safe_answer(query, "Не вдалося доручити (неактивний співробітник?).", show_alert=True)
         return
 
-    # денормалізуємо виконавця в задачу (для статистики/ескалації)
-    _arec = tasks_store.get(feedback_id)
-    if _arec:
-        _arec["assignee_id"] = target_uid
-        storage.save_task(_arec)
-
-    assigner = user_profiles.get(update.effective_user.id, {})
-    assigner_name = get_display_name(assigner)
-    target_profile = user_profiles.get(target_uid, {})
-    target_name = get_display_name(target_profile)
-    now = datetime.now().strftime("%d.%m %H:%M")
-
-    old = assign_store.get(feedback_id)
-    if old:
-        bot_notify = get_bot()
-        reassigned_msg = await safe_send_message(
-            bot_notify, old["assignee_id"],
-            f"❌ Завдання `{feedback_id}` передоручено іншому співробітнику.",
-            parse_mode="Markdown"
-        )
-        if reassigned_msg is not None:
-            track_msg(old["assignee_id"], reassigned_msg.message_id)
-            schedule_delete(context, bot_notify, old["assignee_id"], reassigned_msg.message_id, delay=AUTO_DELETE_DELAY)
-
-    assign_store[feedback_id] = {
-        "assignee_id": target_uid,
-        "assignee_name": target_name,
-        "assigned_by": assigner_name,
-        "assigned_at": now,
-    }
-    save_assign_store(assign_store)
-
-    assign_line = f"\n👤 Доручено: {md(target_name)} — {md(assigner_name)} {now}"
-    _, stored_text = get_msg_data(feedback_id)
-    base_text = stored_text if stored_text else query.message.text
-    lines = [l for l in base_text.split("\n") if not l.startswith("👤 Доручено:")]
-    new_text = "\n".join(lines) + assign_line
-    new_keyboard = build_task_keyboard(safe_id, assigned=True)
-
     bot = get_bot()
-    await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
-
-    # Беремо повний текст із msg_store (з коментарями), фільтруємо лише статуси і доручення
-    _, stored = get_msg_data(feedback_id)
-    base = stored if stored else query.message.text
-    task_lines = [l for l in base.split("\n") if not l.startswith(("✅", "🔄", "↩️", "👤 Доручено:"))]
-    task_text = "\n".join(task_lines).strip()
-
-    assignee_keyboard = build_task_keyboard(safe_id)
-    msg = await safe_send_message(
-        bot, target_uid,
-        f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {md(assigner_name)} {now}_",
-        reply_markup=assignee_keyboard, parse_mode="Markdown"
-    )
-    if msg is not None:
-        track_msg(target_uid, msg.message_id)
-        schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
-        if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict) and "ids" in msg_store[feedback_id]:
-            msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
-        else:
-            msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
-        storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
-
-    add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
-    await query.edit_message_text(f"✅ Завдання `{feedback_id}` доручено *{md(target_name)}*", parse_mode="Markdown")
+    await query.edit_message_text(
+        f"✅ Завдання `{feedback_id}` доручено *{md(res['target_name'])}*", parse_mode="Markdown")
     # Видаляємо підтвердження через 60 сек
     schedule_delete(context, bot, query.message.chat_id, query.message.message_id, delay=60)
 
@@ -1936,45 +2003,28 @@ async def process_comment(update, context):
     if not feedback_id:
         return False
 
-    profile = user_profiles.get(user_id, {})
-    who = get_display_name(profile)
-    now = datetime.now().strftime("%d.%m %H:%M")
-    comment_text = update.message.text.strip()
-    comment_line_raw = f"💬 {who} {now}: {comment_text}"          # для таблиці (без екранування)
-    comment_line = f"💬 {md(who)} {now}: {md(comment_text)}"      # для показу в Telegram
-
-    _, stored_text = get_msg_data(feedback_id)
-    new_text = (stored_text + f"\n{comment_line}") if stored_text else comment_line
-
-    assigned = feedback_id in assign_store
-    keyboard = build_task_keyboard(safe_id or "", assigned=assigned)
-
+    # Сама мутація — спільне ядро (та сама логіка, що й у дашборді); перевірка прав усередині.
+    res = await task_action_comment(feedback_id, user_id, update.message.text or "")
     bot = get_bot()
-    await edit_all_messages(bot, feedback_id, new_text, keyboard)
-    add_task_log(feedback_id, comment_line_raw)
+    if res.get("ok"):
+        out = f"✅ Коментар до `{feedback_id}` збережено."
+    elif res.get("error") == "no_perm":
+        out = "❌ Немає прав на коментар."
+    else:
+        out = "❌ Порожній коментар."
 
     # Редагуємо промпт замість нового повідомлення
     if prompt_msg_id and prompt_chat_id:
         try:
             await bot.edit_message_text(
-                chat_id=prompt_chat_id,
-                message_id=prompt_msg_id,
-                text=f"✅ Коментар до `{feedback_id}` збережено.",
-                parse_mode="Markdown"
-            )
+                chat_id=prompt_chat_id, message_id=prompt_msg_id, text=out, parse_mode="Markdown")
             # Видаляємо підтвердження через 60 сек
             schedule_delete(context, bot, prompt_chat_id, prompt_msg_id, delay=60)
+            return True
         except Exception:
-            sent = await update.message.reply_text(
-                f"✅ Коментар до `{feedback_id}` збережено.", parse_mode="Markdown"
-            )
-            schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=60)
-    else:
-        sent = await update.message.reply_text(
-            f"✅ Коментар до `{feedback_id}` збережено.", parse_mode="Markdown"
-        )
-        schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=60)
-
+            pass
+    sent = await update.message.reply_text(out, parse_mode="Markdown")
+    schedule_delete(context, bot, sent.chat_id, sent.message_id, delay=60)
     return True
 
 
