@@ -2572,7 +2572,7 @@ def refine_prompt_with_claude(current_prompt, instruction):
 Поверни ТІЛЬКИ оновлений промпт без будь-яких пояснень. Обов'язково збережи плейсхолдери <<restaurant>>, <<role_line>>, <<message_text>> на своїх місцях."""
     response = claude_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=4000,   # промпт ~1300 токенів; із запасом, щоб оновлена версія не обрізалась
         messages=[{"role": "user", "content": meta_prompt}]
     )
     return response.content[0].text.strip()
