@@ -823,11 +823,9 @@ async def receive_text(update, context):
         await process_shift_report(update, context)
         return
 
-    # Режим редагування промпту — тільки голосові, текст ігноруємо
+    # Режим редагування промпту — приймаємо інструкцію ТЕКСТОМ (голос — у receive_voice)
     if context.user_data.get('prompt_editing') and is_owner(user_id):
-        msg = await update.message.reply_text("🎙 Для редагування промпту надішліть *голосове* повідомлення.", parse_mode="Markdown")
-        track_msg(msg.chat_id, msg.message_id)
-        schedule_delete(context, _bot, msg.chat_id, msg.message_id, delay=AUTO_DELETE_DELAY)
+        await process_prompt_text(update, context)
         return
 
     # Режим комментария
@@ -2579,58 +2577,17 @@ def refine_prompt_with_claude(current_prompt, instruction):
     )
     return response.content[0].text.strip()
 
-async def process_prompt_voice(update, context):
-    """Обробляє голосове повідомлення власника в режимі редагування промпту."""
-    user_id = update.effective_user.id
+async def _apply_prompt_instruction(context, user_id, instruction):
+    """Спільне ядро редагування промпту: інструкція (з голосу АБО тексту) → новий варіант."""
     bot = get_bot()
-
     cancel_user_jobs(context, user_id, "promptedit")
-
-    # Показуємо статус прямо в меню-повідомленні
     prompt_msg_id = context.user_data.get('prompt_msg_id')
     prompt_chat_id = context.user_data.get('prompt_chat_id')
     try:
-        await bot.edit_message_text(
-            chat_id=prompt_chat_id,
-            message_id=prompt_msg_id,
-            text="⏳ Розпізнаю голосове...",
-            reply_markup=None
-        )
+        await bot.edit_message_text(chat_id=prompt_chat_id, message_id=prompt_msg_id,
+                                    text="⏳ Генерую новий промпт...", reply_markup=None)
     except Exception:
         pass
-
-    # Транскрипція
-    voice_file = await update.message.voice.get_file()
-    file_path = os.path.join(tempfile.gettempdir(), f"promptvoice_{user_id}.ogg")
-    await voice_file.download_to_drive(file_path)
-    instruction = await transcribe_voice(file_path)
-
-    if not instruction:
-        working = context.user_data.get('prompt_working', load_prompt())
-        display = working if len(working) <= 3000 else working[:3000] + "\n...(скорочено)"
-        try:
-            await bot.edit_message_text(
-                chat_id=prompt_chat_id,
-                message_id=prompt_msg_id,
-                text=f"❌ Не вдалося розпізнати. Спробуйте ще раз.\n\n`{display}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")]])
-            )
-        except Exception:
-            pass
-        context.job_queue.run_once(prompt_edit_timeout_callback, when=300,
-            name=f"promptedit_{user_id}", data={"user_id": user_id})
-        return
-
-    # Генерація нового промпту
-    try:
-        await bot.edit_message_text(
-            chat_id=prompt_chat_id, message_id=prompt_msg_id,
-            text="⏳ Генерую новий промпт...", reply_markup=None
-        )
-    except Exception:
-        pass
-
     try:
         current = context.user_data.get('prompt_working', load_prompt())
         new_prompt = await _arun(lambda: refine_prompt_with_claude(current, instruction))
@@ -2640,11 +2597,9 @@ async def process_prompt_voice(update, context):
 
     if not new_prompt:
         try:
-            await bot.edit_message_text(
-                chat_id=prompt_chat_id, message_id=prompt_msg_id,
-                text="❌ Помилка генерації. Спробуйте ще раз.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")]])
-            )
+            await bot.edit_message_text(chat_id=prompt_chat_id, message_id=prompt_msg_id,
+                text="❌ Помилка генерації. Спробуйте ще раз (голосом або текстом).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")]]))
         except Exception:
             pass
         context.job_queue.run_once(prompt_edit_timeout_callback, when=300,
@@ -2652,23 +2607,58 @@ async def process_prompt_voice(update, context):
         return
 
     context.user_data['prompt_working'] = new_prompt
-
     display = new_prompt if len(new_prompt) <= 3000 else new_prompt[:3000] + "\n...(скорочено)"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Прийняти", callback_data="menu_accept_prompt")],
-        [InlineKeyboardButton("🎙 Редагувати далі", callback_data="menu_edit_prompt")],
+        [InlineKeyboardButton("✏️ Редагувати далі", callback_data="menu_edit_prompt")],
         [InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")],
     ])
     try:
-        await bot.edit_message_text(
-            chat_id=prompt_chat_id,
-            message_id=prompt_msg_id,
-            text=f"📋 *Новий варіант промпту:*\n\n`{display}`",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
+        await bot.edit_message_text(chat_id=prompt_chat_id, message_id=prompt_msg_id,
+            text=f"📋 *Новий варіант промпту:*\n\n`{display}`", parse_mode="Markdown", reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Edit prompt msg error: {e}")
+
+
+async def process_prompt_text(update, context):
+    """Редагування промпту ТЕКСТОМ (інструкція = надісланий текст)."""
+    user_id = update.effective_user.id
+    instruction = (update.message.text or "").strip()
+    if not instruction:
+        return
+    await _apply_prompt_instruction(context, user_id, instruction)
+
+
+async def process_prompt_voice(update, context):
+    """Редагування промпту ГОЛОСОМ: транскрибуємо й застосовуємо ту саму логіку."""
+    user_id = update.effective_user.id
+    bot = get_bot()
+    cancel_user_jobs(context, user_id, "promptedit")
+    prompt_msg_id = context.user_data.get('prompt_msg_id')
+    prompt_chat_id = context.user_data.get('prompt_chat_id')
+    try:
+        await bot.edit_message_text(chat_id=prompt_chat_id, message_id=prompt_msg_id,
+                                    text="⏳ Розпізнаю голосове...", reply_markup=None)
+    except Exception:
+        pass
+    voice_file = await update.message.voice.get_file()
+    file_path = os.path.join(tempfile.gettempdir(), f"promptvoice_{user_id}.ogg")
+    await voice_file.download_to_drive(file_path)
+    instruction = await transcribe_voice(file_path)
+    if not instruction:
+        working = context.user_data.get('prompt_working', load_prompt())
+        display = working if len(working) <= 3000 else working[:3000] + "\n...(скорочено)"
+        try:
+            await bot.edit_message_text(chat_id=prompt_chat_id, message_id=prompt_msg_id,
+                text=f"❌ Не вдалося розпізнати. Спробуйте ще раз (голосом або текстом).\n\n`{display}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")]]))
+        except Exception:
+            pass
+        context.job_queue.run_once(prompt_edit_timeout_callback, when=300,
+            name=f"promptedit_{user_id}", data={"user_id": user_id})
+        return
+    await _apply_prompt_instruction(context, user_id, instruction)
 
 # ─── АДМІН-МЕНЮ ──────────────────────────────────────────────────────────────
 
@@ -2916,7 +2906,7 @@ async def handle_admin_menu(update, context):
         display = working if len(working) <= 3000 else working[:3000] + "\n...(скорочено)"
         await query.edit_message_text(
             f"✏️ *Режим редагування промпту*\n\n`{display}`\n\n"
-            "🎙 Надішліть голосове повідомлення з інструкцією що змінити.",
+            "✍️ Надішліть інструкцію, що змінити — *текстом або голосом*.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")],

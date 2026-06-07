@@ -143,8 +143,9 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
 ### 4.8 Інше
 - Привітання з ДН (`send_birthday_greetings`, 06:00).
 - Адмін-меню (`show_admin_menu` / `handle_admin_menu`): список/очікують/зміна
-  ролі/звільнити/відновити; для власника — перегляд і **редагування промпту голосом**
-  (`process_prompt_voice` → `refine_prompt_with_claude`).
+  ролі/звільнити/відновити; для власника — перегляд і **редагування промпту голосом АБО текстом**
+  (`process_prompt_voice`/`process_prompt_text` → `_apply_prompt_instruction` → `refine_prompt_with_claude`).
+  У режимі `prompt_editing` будь-який текст власника = інструкція що змінити (reply-кнопки меню — перевіряються раніше).
 - Зміна ролі співробітником (заявка) і адміном.
 
 ---
