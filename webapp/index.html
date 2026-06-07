@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Пульт керівника</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="who"><span id="who-name">…</span><span id="who-role" class="muted"></span></div>
+    <button id="refresh" class="icon-btn" title="Оновити">⟳</button>
+  </header>
+
+  <main id="view"><div class="loading">Завантаження…</div></main>
+
+  <nav id="tabbar">
+    <button class="tab active" data-tab="board">🔴<span>Задачі</span></button>
+    <button class="tab" data-tab="analytics">📊<span>Аналітика</span></button>
+    <button class="tab" data-tab="shifts">📝<span>Зміни</span></button>
+    <button class="tab" data-tab="staff" id="tab-staff" hidden>👥<span>Персонал</span></button>
+  </nav>
+
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modal-card"></div></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

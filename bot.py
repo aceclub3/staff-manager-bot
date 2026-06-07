@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 import anthropic
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
@@ -50,6 +50,12 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SHEETS_CREDENTIALS = os.path.join(os.path.dirname(__file__), os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json"))
 SPREADSHEET_ID = os.getenv("FEEDBACK_SPREADSHEET_ID")
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x]
+
+# ─── Mini App «Пульт керівника» (дашборд менеджера в Telegram) ────────────────
+WEBAPP_ENABLED = os.getenv("WEBAPP_ENABLED", "1") != "0"
+WEBAPP_HOST = os.getenv("WEBAPP_HOST", "127.0.0.1")        # слухаємо лише локально; назовні — Cloudflare Tunnel
+WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8081"))
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()           # публічний https URL; порожньо = кнопку в меню не показуємо
 
 RESTAURANTS = ["Терраса", "Хочу", "Хочу 2.0"]
 ROLES = ["Офіціант", "Адміністратор", "Повар", "Шеф-повар", "Управляючий", "Виконавчий директор", "Технічний спеціаліст", "Клінінг"]
@@ -91,6 +97,19 @@ ASK_FIRST_NAME, ASK_LAST_NAME, ASK_BIRTHDAY, ASK_PHONE, ASK_ROLE, ASK_RESTAURANT
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Дашборд «Пульт керівника»: API живе в ЦЬОМУ ж процесі (спільні кеші/БД/корутини).
+# Інʼєктуємо живий модуль (а не import bot — бот запускається як __main__, тож
+# `import bot` створив би другий екземпляр з окремими кешами). webapp_api НЕ імпортує
+# bot, тож циклічного імпорту немає.
+_WEBAPP_AVAILABLE = False
+if WEBAPP_ENABLED:
+    try:
+        import webapp_api
+        webapp_api.init(sys.modules[__name__])
+        _WEBAPP_AVAILABLE = True
+    except Exception as e:
+        logger.error(f"Mini App (webapp_api) недоступний, бот працює без дашборду: {e}")
 
 # ─── НАДІЙНЕ ЗБЕРІГАННЯ JSON (атомарний запис + відновлення) ──────────────────
 
@@ -2718,6 +2737,9 @@ def build_admin_menu_keyboard(user_id):
     увесь набір; власник — додатково керування промптом."""
     keyboard = [[InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
                 [InlineKeyboardButton("📝 Підсумки змін", callback_data="menu_shiftreports")]]
+    # Кнопка-вхід у Mini App «Пульт керівника» (лише якщо налаштовано публічний https URL).
+    if WEBAPP_URL:
+        keyboard.insert(0, [InlineKeyboardButton("📊 Пульт керівника", web_app=WebAppInfo(url=WEBAPP_URL))])
     if is_admin(user_id):
         keyboard += [
             [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
@@ -3353,6 +3375,23 @@ async def _post_init(app):
     except Exception as e:
         logger.error(f"post_init tasks load error: {e}")
 
+    # Дашборд «Пульт керівника» — aiohttp-сервер у ТОМУ Ж event-loop (best-effort:
+    # збій сервера НЕ валить бот). Запускаємо після завантаження кешів.
+    if _WEBAPP_AVAILABLE:
+        try:
+            await webapp_api.start(WEBAPP_HOST, WEBAPP_PORT)
+        except Exception as e:
+            logger.error(f"webapp_api start failed (бот працює без дашборду): {e}")
+
+
+async def _post_shutdown(app):
+    """Коректна зупинка дашборду при зупинці бота."""
+    if _WEBAPP_AVAILABLE:
+        try:
+            await webapp_api.stop()
+        except Exception as e:
+            logger.error(f"webapp_api stop failed: {e}")
+
 
 def _result_from_rec(rec):
     return {"category": rec.get("category", "—"), "summary": rec.get("summary", "—"),
@@ -3457,7 +3496,7 @@ def main():
 
     persistence = PicklePersistence(filepath=pkl_path)
     app = (Application.builder().token(BOT_TOKEN)
-           .persistence(persistence).post_init(_post_init).build())
+           .persistence(persistence).post_init(_post_init).post_shutdown(_post_shutdown).build())
     application = app   # щоб get_bot() використовував єдиний керований bot
 
     job_queue = app.job_queue
