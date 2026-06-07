@@ -304,42 +304,48 @@ def build_wip_keyboard(safe_id, assigned=False):
         InlineKeyboardButton("🗑️", callback_data=f"status_del_{safe_id}"),
     ]])
 
+RECIPIENT_ROLES = ADMIN_ROLES | VENUE_ROLES   # = {Управляючий, Виконавчий директор, Адміністратор}
+
+def _profile_venues(p):
+    """Заклади, які бачить/керує користувач. Пріоритет — налаштований у адмінці список
+    `manages`; інакше — за роллю (Виконавчий директор/`all_restaurants` — усі; решта — свій
+    заклад). Повертає множину назв закладів."""
+    m = p.get("manages")
+    if isinstance(m, list) and m:
+        s = {v for v in m if v in RESTAURANTS}
+        if s:
+            return s
+    if p.get("role") in GROUP_ROLES or p.get("all_restaurants"):
+        return set(RESTAURANTS)
+    r = p.get("restaurant")
+    return {r} if r in RESTAURANTS else set(RESTAURANTS)
+
 def get_recipients(category=None, restaurant=None):
-    """Отримувачі сповіщення за роллю і ЗАКЛАДОМ.
-    Власники + Виконавчий директор (GROUP_ROLES) — усі заклади. Управляючий/Адміністратор —
-    лише свій заклад; якщо для закладу немає жодного — резерв: усі менеджери (щоб задача
-    не лишилась без нагляду). Шеф-повар — кухонні категорії (усі заклади)."""
+    """Отримувачі сповіщення за роллю і ЗАКЛАДОМ (з урахуванням налаштованого `manages`).
+    Власники — завжди. Керівні ролі — за своїми закладами. Шеф-повар — кухонні категорії."""
     recipients = set(OWNER_IDS)
-    venue_match, venue_all = set(), set()
+    venue_match, venue_pool = set(), set()
     for uid, p in user_profiles.items():
         if p.get("status") != STATUS_ACTIVE:
             continue
         role = p.get("role", "")
-        if role in GROUP_ROLES or p.get("all_restaurants"):
-            recipients.add(uid)
-        elif role in VENUE_ROLES:
-            venue_all.add(uid)
-            if restaurant is None or p.get("restaurant") == restaurant:
+        if role in RECIPIENT_ROLES:
+            venue_pool.add(uid)
+            if restaurant is None or restaurant in _profile_venues(p):
                 venue_match.add(uid)
         elif role == "Шеф-повар" and category in KITCHEN_CATEGORIES:
             recipients.add(uid)
     recipients |= venue_match
-    # Для закладу без свого менеджера НЕ спамимо менеджерів інших закладів (вони все одно
-    # не мають прав діяти — can_act_on_task). Резерв уже є: власники + Виконавчий директор
-    # завжди в отримувачах і завжди можуть діяти. Лише логуємо «безхазяйний» заклад.
-    if restaurant is not None and not venue_match and venue_all:
-        logger.warning(f"No venue manager for '{restaurant}' — covered by owners/exec only")
+    # Безхазяйний заклад (ніхто його не бачить) прикривають власники — лише логуємо.
+    if restaurant is not None and not venue_match and venue_pool:
+        logger.warning(f"No manager sees venue '{restaurant}' — covered by owners only")
     return recipients
 
 def visible_restaurants(uid):
-    """Які заклади користувач бачить у дайджесті/переліку (власник/дир. — усі)."""
+    """Які заклади користувач бачить у дайджесті/переліку (власник — усі)."""
     if uid in OWNER_IDS:
         return set(RESTAURANTS)
-    p = user_profiles.get(uid, {})
-    if p.get("role") in GROUP_ROLES or p.get("all_restaurants"):
-        return set(RESTAURANTS)
-    r = p.get("restaurant")
-    return {r} if r else set(RESTAURANTS)
+    return _profile_venues(user_profiles.get(uid, {}))
 
 def can_act_on_task(uid, task_restaurant):
     """Чи може користувач діяти на задачі цього закладу (кнопки статусу/доручення/коментар)."""
@@ -348,11 +354,8 @@ def can_act_on_task(uid, task_restaurant):
     p = user_profiles.get(uid, {})
     if p.get("status") != STATUS_ACTIVE:
         return False
-    role = p.get("role")
-    if role in GROUP_ROLES or p.get("all_restaurants"):
-        return True
-    if role in VENUE_ROLES:
-        return task_restaurant is None or p.get("restaurant") == task_restaurant
+    if p.get("role") in RECIPIENT_ROLES:
+        return task_restaurant is None or task_restaurant in _profile_venues(p)
     return False
 
 def is_admin(user_id):
@@ -2680,6 +2683,7 @@ def build_admin_menu_keyboard(user_id):
             [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
             [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
             [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
+            [InlineKeyboardButton("🏠 Доступ до закладів", callback_data="menu_venues")],
             [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
             [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
         ]
@@ -2689,6 +2693,75 @@ def build_admin_menu_keyboard(user_id):
             [InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")],
         ]
     return InlineKeyboardMarkup(keyboard)
+
+
+# ─── ДОСТУП ДО ЗАКЛАДІВ (per-користувач: один / кілька / усі) ─────────────────
+
+def _venue_access_text(uid):
+    p = user_profiles.get(uid, {})
+    venues = _profile_venues(p)
+    cur = "усі заклади" if venues == set(RESTAURANTS) else ", ".join(r for r in RESTAURANTS if r in venues)
+    return (f"🏠 *Доступ: {md(get_display_name(p))}* ({md(p.get('role','—'))})\n"
+            f"Зараз бачить: *{md(cur)}*\n\nНатискайте, щоб увімкнути/вимкнути заклад:")
+
+def _venue_access_keyboard(uid):
+    venues = _profile_venues(user_profiles.get(uid, {}))
+    all_sel = venues == set(RESTAURANTS)
+    rows = [[InlineKeyboardButton(f"{'✅' if r in venues else '▫️'} {r}", callback_data=f"vtoggle_{uid}_{i}")]
+            for i, r in enumerate(RESTAURANTS)]
+    rows.append([InlineKeyboardButton(("✅ " if all_sel else "") + "🌐 Усі заклади", callback_data=f"vall_{uid}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_venues")])
+    return InlineKeyboardMarkup(rows)
+
+async def handle_venue_user(update, context):
+    query = update.callback_query
+    await safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
+    uid = int(query.data.replace("venueuser_", ""))
+    if uid not in user_profiles:
+        await safe_answer(query, "Користувача не знайдено.", show_alert=True)
+        return
+    await query.edit_message_text(_venue_access_text(uid), reply_markup=_venue_access_keyboard(uid), parse_mode="Markdown")
+
+async def handle_venue_toggle(update, context):
+    query = update.callback_query
+    await safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
+    uid_str, idx = query.data.replace("vtoggle_", "").rsplit("_", 1)
+    uid = int(uid_str)
+    p = user_profiles.get(uid)
+    if not p or not idx.isdigit() or int(idx) >= len(RESTAURANTS):
+        await safe_answer(query, "Помилка.", show_alert=True)
+        return
+    r = RESTAURANTS[int(idx)]
+    cur = set(_profile_venues(p))   # старт із поточного видимого набору
+    cur.discard(r) if r in cur else cur.add(r)
+    if not cur:
+        await safe_answer(query, "Має лишитись хоча б один заклад.", show_alert=True)
+        return
+    p["manages"] = [v for v in RESTAURANTS if v in cur]
+    save_profiles(user_profiles)
+    await query.edit_message_text(_venue_access_text(uid), reply_markup=_venue_access_keyboard(uid), parse_mode="Markdown")
+
+async def handle_venue_all(update, context):
+    query = update.callback_query
+    await safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await safe_answer(query, "Немає прав.", show_alert=True)
+        return
+    uid = int(query.data.replace("vall_", ""))
+    p = user_profiles.get(uid)
+    if not p:
+        await safe_answer(query, "Користувача не знайдено.", show_alert=True)
+        return
+    p["manages"] = list(RESTAURANTS)
+    save_profiles(user_profiles)
+    await query.edit_message_text(_venue_access_text(uid), reply_markup=_venue_access_keyboard(uid), parse_mode="Markdown")
+
 
 async def show_admin_menu(update, context):
     user_id = update.effective_user.id
@@ -2717,7 +2790,7 @@ async def handle_admin_menu(update, context):
 
     # «Адміністратор» (can_manage_tasks, але не is_admin) має лише «Невиконані» та повернення;
     # керування персоналом — тільки повним адмінам, керування промптом — лише власнику (нижче).
-    if action in {"staff", "pending", "changerole", "fire", "restore"} and not is_admin(user_id):
+    if action in {"staff", "pending", "changerole", "fire", "restore", "venues"} and not is_admin(user_id):
         await safe_answer(query, "Немає прав.", show_alert=True)
         return
 
@@ -2727,6 +2800,21 @@ async def handle_admin_menu(update, context):
 
     if action == "shiftreports":
         await show_shift_reports(query, context)
+        return
+
+    if action == "venues":
+        active = [(uid, p) for uid, p in user_profiles.items()
+                  if p.get("status") == STATUS_ACTIVE and p.get("role") in RECIPIENT_ROLES]
+        if not active:
+            await query.edit_message_text("Немає керівників для налаштування доступу.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]))
+            return
+        kb = [[InlineKeyboardButton(f"{get_display_name(p)} ({p.get('role','—')})",
+                                    callback_data=f"venueuser_{uid}")] for uid, p in active]
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_back")])
+        await query.edit_message_text(
+            "🏠 *Доступ до закладів*\nОберіть керівника, щоб налаштувати, які заклади він бачить:",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
     elif action == "staff":
@@ -3381,6 +3469,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_menu, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(handle_admin_role_select, pattern="^adminrole_"))
     app.add_handler(CallbackQueryHandler(handle_admin_set_role, pattern="^adminsetrole_"))
+    app.add_handler(CallbackQueryHandler(handle_venue_user, pattern="^venueuser_"))
+    app.add_handler(CallbackQueryHandler(handle_venue_toggle, pattern="^vtoggle_"))
+    app.add_handler(CallbackQueryHandler(handle_venue_all, pattern="^vall_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
     app.add_handler(MessageHandler(filters.VOICE, receive_voice))
 
