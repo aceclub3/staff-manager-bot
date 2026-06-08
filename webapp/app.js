@@ -2,7 +2,15 @@
    Усі дії йдуть в API, що викликає ТІ САМІ корутини бота, що й кнопки в чаті. */
 "use strict";
 const tg = window.Telegram && window.Telegram.WebApp;
-const INIT = (tg && tg.initData) || "";
+// initData від Telegram. Кешуємо в sessionStorage: при перезавантаженні webview
+// (напр., під час рестарту бота) Telegram інколи не передає launch-параметри знову,
+// і tg.initData стає порожнім -> 401. Кеш дозволяє переавторизуватись тим самим
+// (досі валідним, <24год) підписом без потреби перевідкривати застосунок.
+let INIT = (tg && tg.initData) || "";
+try {
+  if (INIT) sessionStorage.setItem("pult_init", INIT);
+  else INIT = sessionStorage.getItem("pult_init") || "";
+} catch (e) {}
 
 function applySafeArea(){
   if (!tg) return;
