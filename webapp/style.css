@@ -65,6 +65,7 @@ main{padding:12px 12px 8px}
 .btn.danger{background:rgba(224,67,42,.14);color:#e0432a}
 .btn.block{display:flex;width:100%}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
+.btn-row + .btn-row{margin-top:8px}
 .btn-row .btn{flex:1;min-width:84px}
 .fab{position:fixed;right:16px;bottom:calc(84px + var(--safe-bottom, 0px));z-index:25;width:54px;height:54px;border-radius:50%;
   background:var(--btn);color:var(--btn-text);border:none;font-size:28px;box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer}
