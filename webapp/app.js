@@ -105,13 +105,13 @@ async function renderBoard(){
   const venues = ME.venues;
   const chips = [];
   chips.push(chip("Відкриті", FILTERS.status==="open", ()=>{FILTERS.status="open";renderBoard();}));
-  chips.push(chip("Закриті", FILTERS.status==="closed", ()=>{FILTERS.status="closed";renderBoard();}));
   if (venues.length > 1){
     chips.push(chip("Усі заклади", !FILTERS.venue, ()=>{FILTERS.venue=null;renderBoard();}));
     venues.forEach(v => chips.push(chip(v, FILTERS.venue===v, ()=>{FILTERS.venue=v;renderBoard();})));
   }
   chips.push(chip("🔥 Термінові", FILTERS.urgency==="Висока", ()=>{FILTERS.urgency=FILTERS.urgency==="Висока"?null:"Висока";renderBoard();}));
   chips.push(chip("⚠️ Без виконавця", FILTERS.unassigned, ()=>{FILTERS.unassigned=!FILTERS.unassigned;renderBoard();}));
+  chips.push(chip("Закриті", FILTERS.status==="closed", ()=>{FILTERS.status="closed";renderBoard();}));   // в самий кінець
 
   let data;
   const q = new URLSearchParams({ status: FILTERS.status });

@@ -73,7 +73,7 @@ main{padding:12px 12px 8px}
 .modal{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.45);display:flex;align-items:flex-end;justify-content:center}
 .modal.hidden{display:none}
 .modal-card{background:var(--bg);width:100%;max-width:560px;max-height:92vh;overflow-y:auto;
-  border-radius:18px 18px 0 0;padding:16px 16px 28px}
+  border-radius:18px 18px 0 0;padding:16px 16px calc(28px + var(--safe-bottom, 0px))}
 .modal h3{margin:2px 0 10px}
 .modal .close{float:right;font-size:22px;background:none;border:none;color:var(--hint);cursor:pointer;margin-top:-4px}
 .kv{display:flex;gap:8px;margin:5px 0;font-size:14px}
