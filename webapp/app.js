@@ -136,9 +136,14 @@ function taskCard(t){
   const noass = (!t.resolved && !t.assignee_id) ? `<span class="badge warn">⚠️ без виконавця</span>` : "";
   const ph = t.has_photo ? `<span class="badge">📷</span>` : "";
   const ass = t.assignee_name ? `<span class="badge">👤 ${esc(t.assignee_name)}</span>` : "";
+  // превʼю останнього запису історії (коментар/статус) + скільки ще записів
+  const entries = (t.log || "").split(" | ").map(s => s.trim()).filter(Boolean);
+  const last = entries.length
+    ? `<div class="card-last">${esc(entries[entries.length - 1])}${entries.length > 1 ? ` <span class="muted">· ще ${entries.length - 1}</span>` : ""}</div>`
+    : "";
   c.innerHTML = `<div class="row1">${dot}<span class="fid">${esc(t.fid)}</span> · ${esc(t.restaurant)}
       · ${t.category_icon} ${esc(t.category)} ${t.urgency_icon} ${age} ${noass} ${ph} ${ass}</div>
-    <div class="summary">${esc(t.summary)}</div>`;
+    <div class="summary">${esc(t.summary)}</div>${last}`;
   return c;
 }
 function ensureFab(){

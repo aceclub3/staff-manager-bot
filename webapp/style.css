@@ -49,6 +49,8 @@ main{padding:12px 12px 8px}
 .card .row1{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--hint);margin-bottom:4px;flex-wrap:wrap}
 .card .fid{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--link)}
 .card .summary{font-size:14.5px;color:var(--text);word-break:break-word}
+.card-last{color:var(--hint);font-size:12px;margin-top:6px;border-left:2px solid var(--border);
+  padding-left:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:10px;font-size:11.5px;background:var(--sec)}
 .badge.warn{background:rgba(255,90,60,.16);color:#e0432a}
 .badge.age{background:rgba(255,170,0,.16);color:#b07400}
