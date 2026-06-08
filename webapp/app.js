@@ -169,11 +169,11 @@ async function openTask(fid){
       <button class="btn" data-a="wip">🔧 В роботі</button>
       <button class="btn" data-a="assign">👤 Доручити</button></div>
       <div class="btn-row"><button class="btn" data-a="comment">💬 Коментар</button>
-      ${t.is_owner?`<button class="btn danger" data-a="del">🗑️ Видалити</button>`:""}</div>`;
+      ${t.can_delete?`<button class="btn danger" data-a="del">🗑️ Видалити</button>`:""}</div>`;
   } else if (t.resolved && act){
     actions = `<div class="btn-row"><button class="btn" data-a="cancel">↩️ Відновити</button>
       <button class="btn" data-a="comment">💬 Коментар</button>
-      ${t.is_owner?`<button class="btn danger" data-a="del">🗑️ Видалити</button>`:""}</div>`;
+      ${t.can_delete?`<button class="btn danger" data-a="del">🗑️ Видалити</button>`:""}</div>`;
   }
   const entries = (t.log || "").split(" | ").map(s => s.trim()).filter(Boolean);
   const history = `<div class="hsec">💬 Історія та коментарі</div>` + (entries.length

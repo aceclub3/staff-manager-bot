@@ -1774,9 +1774,10 @@ async def task_action_status(feedback_id, action, actor_id, fallback_text=None):
     return {"ok": True, "status_text": status_text}
 
 async def task_action_delete(feedback_id, actor_id):
-    """Видалення задачі (лише власник): прибирає живі повідомлення, чистить кеші, закриває петлю."""
-    if not is_owner(actor_id):
-        return {"ok": False, "error": "owner_only"}
+    """Видалення задачі (власник + повні адміни: Управляючий/Виконавчий директор) — прибирає
+    живі повідомлення, чистить кеші, закриває петлю. Лінійна роль «Адміністратор» — НЕ може."""
+    if not is_admin(actor_id):
+        return {"ok": False, "error": "no_perm"}
     rec = tasks_store.get(feedback_id, {})
     who = get_display_name(user_profiles.get(actor_id, {}))
     now = datetime.now().strftime("%d.%m %H:%M")
@@ -1904,7 +1905,7 @@ async def handle_status_update(update, context):
     if action == "del":
         res = await task_action_delete(feedback_id, user_id)
         if not res.get("ok"):
-            await safe_answer(query, "Тільки власник може видаляти.", show_alert=True)
+            await safe_answer(query, "Видаляти може лише керівник (Управляючий/Виконавчий директор/власник).", show_alert=True)
         return
 
     # done / wip / cancel — спільне ядро (та сама логіка, що й у дашборді).

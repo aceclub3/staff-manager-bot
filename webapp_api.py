@@ -230,6 +230,7 @@ async def api_task_detail(request):
         return web.json_response({"error": "forbidden"}, status=403)
     t = _serialize_task(fid, rec, uid)
     t["is_owner"] = B.is_owner(uid)
+    t["can_delete"] = B.is_admin(uid)   # видаляти можуть повні адміни + власник
     return web.json_response({"task": t})
 
 
