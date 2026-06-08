@@ -160,7 +160,10 @@ async function openTask(fid){
       <button class="btn" data-a="comment">💬 Коментар</button>
       ${t.is_owner?`<button class="btn danger" data-a="del">🗑️ Видалити</button>`:""}</div>`;
   }
-  const log = t.log ? `<div class="log">${esc(t.log).replace(/ \| /g,"\n")}</div>` : "";
+  const entries = (t.log || "").split(" | ").map(s => s.trim()).filter(Boolean);
+  const history = `<div class="hsec">💬 Історія та коментарі</div>` + (entries.length
+    ? `<div class="history">${entries.map(e => `<div class="hitem">${esc(e)}</div>`).join("")}</div>`
+    : `<div class="hint" style="padding:2px 2px 4px">— поки немає —</div>`);
   openModal(`<button class="close" onclick="closeModalGlobal()">✕</button>
     <h3>${t.category_icon} ${esc(t.category)} ${t.urgency_icon}</h3>
     <div class="kv"><span class="k">Номер</span><span class="fid">${esc(t.fid)}</span></div>
@@ -172,7 +175,7 @@ async function openTask(fid){
     ${t.assignee_name?`<div class="kv"><span class="k">Виконавець</span><span>${esc(t.assignee_name)}</span></div>`:""}
     <div class="kv"><span class="k">Створено</span><span>${esc(t.created_date)} ${esc(t.created_time)} · ⏰${t.age_days}д</span></div>
     ${t.has_photo?`<img class="detail-photo" id="dphoto" alt="фото">`:""}
-    ${log}
+    ${history}
     <div style="height:10px"></div>
     ${actions}`);
   if (t.has_photo) loadPhoto(t.fid, document.getElementById("dphoto"));

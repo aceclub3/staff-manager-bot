@@ -77,6 +77,9 @@ main{padding:12px 12px 8px}
 .kv{display:flex;gap:8px;margin:5px 0;font-size:14px}
 .kv .k{color:var(--hint);min-width:96px}
 .log{background:var(--sec);border-radius:10px;padding:10px;margin-top:8px;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.hsec{font-weight:600;font-size:14px;margin:14px 2px 7px}
+.history{display:flex;flex-direction:column;gap:6px}
+.hitem{background:var(--sec);border-radius:9px;padding:8px 10px;font-size:13px;white-space:pre-wrap;word-break:break-word}
 .detail-photo{width:100%;border-radius:12px;margin:10px 0;display:block}
 textarea,select,input{width:100%;background:var(--sec);color:var(--text);border:1px solid var(--border);
   border-radius:10px;padding:10px;font-size:15px;font-family:inherit;margin:6px 0}

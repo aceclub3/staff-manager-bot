@@ -498,6 +498,9 @@ def get_main_keyboard(user_id):
     buttons = [[KeyboardButton("💬 Надіслати повідомлення")],
                [KeyboardButton(SHIFT_REPORT_BTN)]]   # підсумок зміни — доступний усім активним
     if can_manage_tasks(user_id):
+        # Пряма кнопка-вхід у Mini App (якщо задано публічний https URL) + адмін-меню.
+        if WEBAPP_URL:
+            buttons.append([KeyboardButton("📊 Пульт керівника", web_app=WebAppInfo(url=WEBAPP_URL))])
         buttons.append([KeyboardButton("👨‍💼 Адмін-меню")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
