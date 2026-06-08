@@ -255,7 +255,8 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
   `can_act_on_task` (ядро); видалення/керівні ролі — `is_owner`; персонал — `is_admin`.
 - **Ендпоінти** (`/api/...`): `me`, `tasks` (GET список з фільтром за `visible_restaurants` + POST створити),
   `tasks/{fid}` (деталі), `photo/{fid}` (лише з дозволених тек E:/G: або фолбек по file_id), дії
-  `status|delete|comment|assign`, `staff` (+ `venues/role/approve/reject/fire/restore`), `analytics`,
+  `status|delete|comment|assign|venue` (зміна закладу — `task_action_set_venue`, `is_admin`, виправлення
+  хибної класифікації Claude), `staff` (+ `venues/role/approve/reject/fire/restore`), `analytics`,
   `shift-reports` (+ `/to-task`), **`prompt`** (GET + POST publish + `/refine` + `/rollback` + `/test`).
   **Будь-який gspread/Claude в API — теж лише через `_arun`** (не блокуй loop).
 - **Промпт (вкладка ⚙️, лише власник)**: активний промпт — у `prompt.json` (звідти читає `analyze_with_claude`),

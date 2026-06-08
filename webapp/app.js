@@ -179,6 +179,10 @@ async function openTask(fid){
   const history = `<div class="hsec">💬 Історія та коментарі</div>` + (entries.length
     ? `<div class="history">${entries.map(e => `<div class="hitem">${esc(e)}</div>`).join("")}</div>`
     : `<div class="hint" style="padding:2px 2px 4px">— поки немає —</div>`);
+  // зміна закладу (виправлення хибної класифікації) — лише для повних адмінів/власника
+  const venueCtl = t.is_admin ? `<div class="hsec">🏠 Змінити заклад</div>
+    <div class="btn-row" id="venuectl">${ME.all_restaurants.map(r =>
+      `<button class="btn${r===t.restaurant?" primary":""}" data-venue="${esc(r)}">${esc(r)}</button>`).join("")}</div>` : "";
   openModal(`<button class="close" onclick="closeModalGlobal()">✕</button>
     <h3>${t.category_icon} ${esc(t.category)} ${t.urgency_icon}</h3>
     <div class="kv"><span class="k">Номер</span><span class="fid">${esc(t.fid)}</span></div>
@@ -190,11 +194,18 @@ async function openTask(fid){
     ${t.assignee_name?`<div class="kv"><span class="k">Виконавець</span><span>${esc(t.assignee_name)}</span></div>`:""}
     <div class="kv"><span class="k">Створено</span><span>${esc(t.created_date)} ${esc(t.created_time)} · ⏰${t.age_days}д</span></div>
     ${t.has_photo?`<img class="detail-photo" id="dphoto" alt="фото">`:""}
+    ${venueCtl}
     ${history}
     <div style="height:10px"></div>
     ${actions}`);
   if (t.has_photo) loadPhoto(t.fid, document.getElementById("dphoto"));
   modalCard.querySelectorAll("[data-a]").forEach(b => b.onclick = () => taskAction(t, b.dataset.a));
+  modalCard.querySelectorAll("#venuectl [data-venue]").forEach(b => b.onclick = async () => {
+    if (b.dataset.venue === t.restaurant) return;
+    try { await api(`/api/tasks/${encodeURIComponent(t.fid)}/venue`, {method:"POST", body:{restaurant:b.dataset.venue}});
+      haptic("success"); toast("Заклад → " + b.dataset.venue); openTask(t.fid); render(); }
+    catch(e){ toast(errText(e)); }
+  });
 }
 window.closeModalGlobal = closeModal;
 

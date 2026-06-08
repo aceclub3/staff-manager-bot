@@ -1619,6 +1619,21 @@ async def _mirror_log_to_sheet(feedback_id, entry):
     except Exception as e:
         logger.error(f"Sheet mirror (log) failed {feedback_id}: {e}")
 
+async def _mirror_venue_to_sheet(feedback_id, restaurant):
+    if not feedback_id or str(feedback_id).startswith("LOCAL-"):
+        return
+    def _do():
+        ws = get_worksheet()
+        all_ids = ws.col_values(1)
+        for i, val in enumerate(all_ids):
+            if val == feedback_id:
+                ws.update_cell(i + 1, 4, restaurant)   # колонка «Заклад» = 4
+                return
+    try:
+        await _arun(lambda: _sheet_retry(_do))
+    except Exception as e:
+        logger.error(f"Sheet mirror (venue) failed {feedback_id}: {e}")
+
 async def send_notifications(result, user_data, profile, photo_file_id=None, feedback_id=None,
                              context=None, photo_path="", send_live_photo=True):
     try:
@@ -1884,6 +1899,30 @@ async def task_action_assign(feedback_id, target_uid, actor_id, context=None, fa
         storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
     add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
     return {"ok": True, "target_name": target_name}
+
+
+async def task_action_set_venue(feedback_id, new_restaurant, actor_id):
+    """Зміна закладу задачі (виправлення хибної класифікації Claude). Власник + повні адміни
+    (`is_admin`). Оновлює запис — board/дайджест/маршрут одразу показують новий заклад — + лог
+    + дзеркало Sheets. Історичний чат-заголовок не переписуємо (зміна видима в історії/на картці)."""
+    if not is_admin(actor_id):
+        return {"ok": False, "error": "no_perm"}
+    if new_restaurant not in RESTAURANTS:
+        return {"ok": False, "error": "bad_venue"}
+    rec = tasks_store.get(feedback_id)
+    if not rec:
+        return {"ok": False, "error": "not_found"}
+    old = rec.get("restaurant", "")
+    if old == new_restaurant:
+        return {"ok": True, "restaurant": new_restaurant}
+    who = get_display_name(user_profiles.get(actor_id, {}))
+    now = datetime.now().strftime("%d.%m %H:%M")
+    rec["restaurant"] = new_restaurant
+    storage.save_task(rec)
+    add_task_log(feedback_id, f"🏠 Заклад змінено: {old or '—'} → {new_restaurant} — {who} {now}")
+    asyncio.create_task(_mirror_venue_to_sheet(feedback_id, new_restaurant))
+    logger.info(f"Task {feedback_id} venue {old} -> {new_restaurant} by {actor_id}")
+    return {"ok": True, "restaurant": new_restaurant}
 
 
 async def handle_status_update(update, context):

@@ -230,6 +230,7 @@ async def api_task_detail(request):
         return web.json_response({"error": "forbidden"}, status=403)
     t = _serialize_task(fid, rec, uid)
     t["is_owner"] = B.is_owner(uid)
+    t["is_admin"] = B.is_admin(uid)     # зміна закладу — для повних адмінів + власника
     t["can_delete"] = B.is_admin(uid)   # видаляти можуть повні адміни + власник
     return web.json_response({"task": t})
 
@@ -272,7 +273,8 @@ def _action_response(res):
         return web.json_response({"ok": True, **{k: v for k, v in res.items() if k != "ok"}})
     err = res.get("error")
     status = {"no_perm": 403, "owner_only": 403, "already_closed": 409,
-              "bad_target": 400, "empty": 400, "bad_action": 400}.get(err, 400)
+              "bad_target": 400, "empty": 400, "bad_action": 400,
+              "bad_venue": 400, "not_found": 404}.get(err, 400)
     return web.json_response({"ok": False, "error": err, "status": res.get("status")}, status=status)
 
 
@@ -311,6 +313,14 @@ async def api_assign(request):
     except (TypeError, ValueError):
         return web.json_response({"ok": False, "error": "bad_target"}, status=400)
     res = await B.task_action_assign(fid, target_uid, uid, context=_api_context())
+    return _action_response(res)
+
+
+async def api_task_venue(request):
+    uid = request["uid"]
+    fid = request.match_info["fid"]
+    body = await _json_body(request)
+    res = await B.task_action_set_venue(fid, body.get("restaurant"), uid)
     return _action_response(res)
 
 
@@ -701,6 +711,7 @@ def build_app():
     app.router.add_post("/api/tasks/{fid}/delete", api_delete)
     app.router.add_post("/api/tasks/{fid}/comment", api_comment)
     app.router.add_post("/api/tasks/{fid}/assign", api_assign)
+    app.router.add_post("/api/tasks/{fid}/venue", api_task_venue)
     app.router.add_get("/api/staff", api_staff)
     app.router.add_post("/api/staff/{tid}/venues", api_set_venues)
     app.router.add_post("/api/staff/{tid}/role", api_set_role)
