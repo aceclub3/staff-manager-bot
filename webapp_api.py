@@ -574,8 +574,29 @@ async def api_report_to_task(request):
 
 # ─── СТАТИКА / СЕРВЕР ─────────────────────────────────────────────────────────
 
+def _asset_version():
+    """Версія ассетів = найбільший mtime app.js/style.css. Змінюється лише при правці
+    файлів -> URL міняється -> Telegram перетягує свіже (анти-кеш Mini App)."""
+    try:
+        return str(int(max(
+            os.path.getmtime(os.path.join(WEBAPP_DIR, "app.js")),
+            os.path.getmtime(os.path.join(WEBAPP_DIR, "style.css")))))
+    except Exception:
+        return "1"
+
+
 async def index(request):
-    return web.FileResponse(os.path.join(WEBAPP_DIR, "index.html"))
+    # index — завжди свіжий (no-store); до ассетів додаємо ?v=<mtime> для надійного оновлення.
+    try:
+        with open(os.path.join(WEBAPP_DIR, "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        v = _asset_version()
+        html = (html.replace("/static/app.js", f"/static/app.js?v={v}")
+                    .replace("/static/style.css", f"/static/style.css?v={v}"))
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+    except Exception:
+        return web.FileResponse(os.path.join(WEBAPP_DIR, "index.html"))
 
 
 async def health(request):

@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 import anthropic
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, WebAppInfo, MenuButtonWebApp
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
@@ -498,9 +498,9 @@ def get_main_keyboard(user_id):
     buttons = [[KeyboardButton("💬 Надіслати повідомлення")],
                [KeyboardButton(SHIFT_REPORT_BTN)]]   # підсумок зміни — доступний усім активним
     if can_manage_tasks(user_id):
-        # Пряма кнопка-вхід у Mini App (якщо задано публічний https URL) + адмін-меню.
-        if WEBAPP_URL:
-            buttons.append([KeyboardButton("📊 Пульт керівника", web_app=WebAppInfo(url=WEBAPP_URL))])
+        # Вхід у Mini App — через надійну кнопку «☰ Пульт» біля поля вводу (chat menu button,
+        # ставиться в _post_init). Reply-web-app кнопку не використовуємо: на iOS вона часто
+        # не передає initData. Тут лишається лише адмін-меню.
         buttons.append([KeyboardButton("👨‍💼 Адмін-меню")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -3385,6 +3385,20 @@ async def _post_init(app):
             await webapp_api.start(WEBAPP_HOST, WEBAPP_PORT)
         except Exception as e:
             logger.error(f"webapp_api start failed (бот працює без дашборду): {e}")
+        # Кнопка «☰ Пульт» біля поля вводу для всіх керівників — надійний one-tap вхід у Mini App
+        # (на відміну від reply-web-app, menu button стабільно передає initData).
+        if WEBAPP_URL:
+            targets = set(OWNER_IDS) | {uid for uid in user_profiles if can_manage_tasks(uid)}
+            ok = 0
+            for uid in targets:
+                try:
+                    await app.bot.set_chat_menu_button(
+                        chat_id=uid,
+                        menu_button=MenuButtonWebApp(text="Пульт", web_app=WebAppInfo(url=WEBAPP_URL)))
+                    ok += 1
+                except Exception:
+                    pass
+            logger.info(f"menu button (Пульт) set for {ok}/{len(targets)} managers")
 
 
 async def _post_shutdown(app):
