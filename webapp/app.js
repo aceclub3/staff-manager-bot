@@ -81,6 +81,7 @@ async function boot(){
   document.getElementById("who-name").textContent = ME.name;
   document.getElementById("who-role").textContent = ME.role + (ME.venues.length ? " · "+ME.venues.join(", ") : "");
   if (ME.is_admin) document.getElementById("tab-staff").hidden = false;
+  if (ME.is_owner) document.getElementById("tab-prompt").hidden = false;
   render();
 }
 document.getElementById("refresh").addEventListener("click", render);
@@ -95,6 +96,7 @@ function render(){
   else if (TAB === "analytics") renderAnalytics();
   else if (TAB === "shifts") renderShifts();
   else if (TAB === "staff") renderStaff();
+  else if (TAB === "prompt") renderPrompt();
 }
 
 /* ---------- BOARD ---------- */
@@ -389,6 +391,71 @@ function roleDialog(uid, name){
     try{ await api(`/api/staff/${uid}/role`,{method:"POST",body:{role}}); haptic("success"); toast("Роль змінено"); closeModal(); renderStaff(); }
     catch(e){ toast(errText(e)); }
   };
+}
+
+/* ---------- PROMPT (owner only) ---------- */
+async function renderPrompt(){
+  removeFab();
+  view.innerHTML = `<div class="loading">Завантаження…</div>`;
+  let d;
+  try { d = await api("/api/prompt"); } catch(e){ view.innerHTML=`<div class="empty">${esc(errText(e))}</div>`; return; }
+  const rests = ME.all_restaurants.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join("");
+  const vers = d.versions.map(v=>`<div class="staff-item">
+      <div class="nm">v${v.id} <span class="tag">${esc(v.ts)}</span></div>
+      <div class="hint" style="margin-top:3px">${esc(v.author_name)}${v.note?` · ${esc(v.note)}`:""} · ${v.len} симв.</div>
+      <div class="hint" style="margin-top:3px">${esc(v.preview)}…</div>
+      <div class="btn-row" style="margin-top:8px"><button class="btn" data-roll="${v.id}">↩️ Відкат до цієї</button></div>
+    </div>`).join("") || `<div class="hint">—</div>`;
+  view.innerHTML = `<div class="section-title">⚙️ Промпт класифікатора</div>
+    <div class="hint">Інструкція, за якою Claude розбирає повідомлення персоналу. Зміни впливають на ВСІ нові задачі. Плейсхолдери <code>&lt;&lt;restaurant&gt;&gt;</code>, <code>&lt;&lt;role_line&gt;&gt;</code>, <code>&lt;&lt;message_text&gt;&gt;</code> мають лишатися.</div>
+    <textarea id="pp" style="min-height:240px">${esc(d.current)}</textarea>
+    <input id="pp-note" placeholder="Нотатка до версії (необовʼязково)">
+    <div class="btn-row"><button class="btn primary" id="pp-pub">💾 Опублікувати</button>
+      <button class="btn" id="pp-reset">↺ Скинути зміни</button></div>
+
+    <div class="hsec">🤖 AI-підказка</div>
+    <div class="hint">Опиши, що змінити — Claude перепише, результат ляже у поле вище (сам не публікує).</div>
+    <textarea id="pp-instr" placeholder="напр.: скарги гостей завжди Висока; додай категорію «Доставка»"></textarea>
+    <button class="btn block" id="pp-ai">Згенерувати у поле</button>
+
+    <div class="hsec">🧪 Тест на прикладі</div>
+    <select id="pp-rest">${rests}</select>
+    <textarea id="pp-sample" placeholder="Встав реальне повідомлення працівника…"></textarea>
+    <button class="btn block" id="pp-test">Прогнати чернетку</button>
+    <div id="pp-testout"></div>
+
+    <div class="hsec">🕘 Історія версій</div>${vers}`;
+
+  const ta = document.getElementById("pp");
+  document.getElementById("pp-reset").onclick = () => { ta.value = d.current; toast("Повернуто до активного"); };
+  document.getElementById("pp-pub").onclick = async () => {
+    const text = ta.value.trim(); if (!text) return;
+    const note = document.getElementById("pp-note").value.trim();
+    const btn = document.getElementById("pp-pub"); btn.textContent="Публікую…"; btn.disabled=true;
+    try { await api("/api/prompt",{method:"POST",body:{text, note}}); haptic("success"); toast("Опубліковано"); renderPrompt(); }
+    catch(e){ toast(e.message==="missing_placeholders"?"Бракує плейсхолдерів (<<…>>)":errText(e)); btn.textContent="💾 Опублікувати"; btn.disabled=false; }
+  };
+  document.getElementById("pp-ai").onclick = async () => {
+    const instruction = document.getElementById("pp-instr").value.trim(); if (!instruction) return;
+    const btn = document.getElementById("pp-ai"); btn.textContent="Генерую…"; btn.disabled=true;
+    try { const r = await api("/api/prompt/refine",{method:"POST",body:{instruction, base: ta.value}});
+      ta.value = r.text; haptic("success"); toast("Готово — перевір у полі вище"); }
+    catch(e){ toast(errText(e)); }
+    btn.textContent="Згенерувати у поле"; btn.disabled=false;
+  };
+  document.getElementById("pp-test").onclick = async () => {
+    const sample = document.getElementById("pp-sample").value.trim(); if (!sample) return;
+    const out = document.getElementById("pp-testout"); out.innerHTML = `<div class="hint" style="margin-top:8px">Аналізую…</div>`;
+    try {
+      const r = await api("/api/prompt/test",{method:"POST",body:{text:sample, prompt:ta.value, restaurant:document.getElementById("pp-rest").value}});
+      out.innerHTML = (r.results||[]).map(x=>`<div class="hitem" style="margin-top:8px">
+        ${esc(x.category||"—")} · ${esc(x.urgency||"—")} · ${esc(x.restaurant||"—")} · → ${esc(x.responsible||"—")}<br>${esc(x.summary||"")}</div>`).join("") || `<div class="hint">— нічого —</div>`;
+    } catch(e){ out.innerHTML = `<div class="hint" style="margin-top:8px">${esc(errText(e))}</div>`; }
+  };
+  view.querySelectorAll("[data-roll]").forEach(b=>b.onclick=async()=>{
+    const go = async () => { try{ await api("/api/prompt/rollback",{method:"POST",body:{id:Number(b.dataset.roll)}}); haptic("success"); toast("Відкат виконано"); renderPrompt(); }catch(e){ toast(errText(e)); } };
+    if (tg && tg.showConfirm) tg.showConfirm("Відкатити промпт до v"+b.dataset.roll+"?", v=>{ if(v) go(); }); else if (confirm("Відкат?")) go();
+  });
 }
 
 function removeFab(){ const f=document.getElementById("fab"); if(f) f.remove(); }

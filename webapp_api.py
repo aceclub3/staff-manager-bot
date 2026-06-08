@@ -572,6 +572,90 @@ async def api_report_to_task(request):
     return web.json_response({"ok": True, "ids": ids})
 
 
+# ─── ЕНДПОІНТИ: промпт класифікатора (лише власник) ───────────────────────────
+
+def _require_owner(request):
+    return B.is_owner(request["uid"])
+
+
+async def api_prompt_get(request):
+    if not _require_owner(request):
+        return web.json_response({"error": "owner_only"}, status=403)
+    versions = B._ensure_prompt_seed()
+    out = [{
+        "id": v.get("id"), "ts": v.get("ts", ""), "author_name": v.get("author_name", "—"),
+        "note": v.get("note", ""), "len": len(v.get("text", "")),
+        "preview": (v.get("text", "")[:90]),
+    } for v in reversed(versions)]   # новіші згори
+    return web.json_response({"current": B.load_prompt(), "versions": out})
+
+
+async def api_prompt_publish(request):
+    if not _require_owner(request):
+        return web.json_response({"error": "owner_only"}, status=403)
+    body = await _json_body(request)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return web.json_response({"ok": False, "error": "empty"}, status=400)
+    # збережемо плейсхолдери: без них analyze_with_claude зламається
+    missing = [p for p in ("<<restaurant>>", "<<role_line>>", "<<message_text>>") if p not in text]
+    if missing:
+        return web.json_response({"ok": False, "error": "missing_placeholders", "missing": missing}, status=400)
+    v = B.publish_prompt(text, request["uid"], note=body.get("note", ""))
+    if not v:
+        return web.json_response({"ok": False, "error": "rejected"}, status=400)
+    return web.json_response({"ok": True, "version": {"id": v["id"], "ts": v["ts"]}})
+
+
+async def api_prompt_refine(request):
+    if not _require_owner(request):
+        return web.json_response({"error": "owner_only"}, status=403)
+    body = await _json_body(request)
+    instruction = (body.get("instruction") or "").strip()
+    if not instruction:
+        return web.json_response({"ok": False, "error": "empty"}, status=400)
+    current = body.get("base") or B.load_prompt()
+    try:
+        new_prompt = await B._arun(lambda: B.refine_prompt_with_claude(current, instruction))
+    except Exception as e:
+        logger.error(f"prompt refine failed: {e}")
+        return web.json_response({"ok": False, "error": "claude_failed"}, status=502)
+    return web.json_response({"ok": True, "text": new_prompt})
+
+
+async def api_prompt_rollback(request):
+    if not _require_owner(request):
+        return web.json_response({"error": "owner_only"}, status=403)
+    body = await _json_body(request)
+    try:
+        vid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return web.json_response({"ok": False, "error": "bad_id"}, status=400)
+    v = B.rollback_prompt(vid, request["uid"])
+    if not v:
+        return web.json_response({"ok": False, "error": "not_found"}, status=404)
+    return web.json_response({"ok": True, "version": {"id": v["id"], "ts": v["ts"]}})
+
+
+async def api_prompt_test(request):
+    """Прогнати ЧЕРНЕТКУ промпту на реальному повідомленні ДО публікації."""
+    if not _require_owner(request):
+        return web.json_response({"error": "owner_only"}, status=403)
+    body = await _json_body(request)
+    msg = (body.get("text") or "").strip()
+    candidate = (body.get("prompt") or "").strip() or None
+    if not msg:
+        return web.json_response({"ok": False, "error": "empty"}, status=400)
+    rest = body.get("restaurant") if body.get("restaurant") in B.RESTAURANTS else "Терраса"
+    prof = {"restaurant": rest, "role": "Офіціант"}
+    try:
+        results = await B.analyze_with_claude(msg, prof, is_anonymous=False, template_override=candidate)
+    except Exception as e:
+        logger.error(f"prompt test failed: {e}")
+        return web.json_response({"ok": False, "error": "claude_failed"}, status=502)
+    return web.json_response({"ok": True, "results": results})
+
+
 # ─── СТАТИКА / СЕРВЕР ─────────────────────────────────────────────────────────
 
 def _asset_version():
@@ -626,6 +710,11 @@ def build_app():
     app.router.add_get("/api/analytics", api_analytics)
     app.router.add_get("/api/shift-reports", api_shift_reports)
     app.router.add_post("/api/shift-reports/{key}/to-task", api_report_to_task)
+    app.router.add_get("/api/prompt", api_prompt_get)
+    app.router.add_post("/api/prompt", api_prompt_publish)
+    app.router.add_post("/api/prompt/refine", api_prompt_refine)
+    app.router.add_post("/api/prompt/rollback", api_prompt_rollback)
+    app.router.add_post("/api/prompt/test", api_prompt_test)
     if os.path.isdir(WEBAPP_DIR):
         app.router.add_static("/static/", WEBAPP_DIR)
     return app

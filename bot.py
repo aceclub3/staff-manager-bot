@@ -261,6 +261,91 @@ def load_prompt():
 def save_prompt(template):
     _atomic_write_json(PROMPT_FILE, {"template": template})
 
+
+# ─── ВЕРСІЇ ПРОМПТУ (історія + відкат; єдине джерело — SQLite meta) ───────────
+# Активний промпт лишається в prompt.json (звідти читає analyze_with_claude),
+# а повна історія версій — у meta['prompt_versions'] (JSON-список). Дашборд і чат-резерв
+# пишуть/читають ОДНЕ це сховище, тож стан не розходиться.
+PROMPT_VERSIONS_CAP = 40
+
+def _load_prompt_versions():
+    raw = storage.meta_get("prompt_versions")
+    if raw:
+        try:
+            v = json.loads(raw)
+            if isinstance(v, list):
+                return v
+        except Exception:
+            pass
+    return []
+
+def _save_prompt_versions(versions):
+    storage.meta_set("prompt_versions", json.dumps(versions[-PROMPT_VERSIONS_CAP:], ensure_ascii=False))
+
+PROMPT_PLACEHOLDERS = ("<<restaurant>>", "<<role_line>>", "<<message_text>>")
+
+def _ensure_prompt_seed():
+    """Гарантує історію + що ВЕРХНЯ версія == активний промпт (prompt.json). Самовідновлення:
+    якщо prompt.json змінили повз publish_prompt (ручна правка тощо) — дописуємо версію, щоб
+    версійне сховище ніколи не розходилось з активним промптом (звідки реально читає бот)."""
+    versions = _load_prompt_versions()
+    active = load_prompt()
+    if not versions:
+        versions = [{
+            "id": 1, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "author": None, "author_name": "—", "note": "Початкова версія", "text": active,
+        }]
+        _save_prompt_versions(versions)
+        return versions
+    if versions[-1].get("text") != active:
+        vid = max((x.get("id", 0) for x in versions), default=0) + 1
+        versions.append({
+            "id": vid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "author": None, "author_name": "—", "note": "Зовнішня зміна", "text": active,
+        })
+        _save_prompt_versions(versions)
+    return versions
+
+def publish_prompt(text, author_id=None, note=""):
+    """Публікує новий промпт: додає версію + робить активним (prompt.json). Повертає версію або None.
+    ЄДИНИЙ писар prompt.json (окрім самого save_prompt усередині). Інваріант — наявність плейсхолдерів,
+    тож і API publish, і будь-який відкат покриті одним гейтом тут (без нього analyze_with_claude зламається)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if any(p not in text for p in PROMPT_PLACEHOLDERS):
+        logger.error("publish_prompt rejected: missing placeholder(s)")
+        return None
+    versions = _ensure_prompt_seed()
+    vid = max((x.get("id", 0) for x in versions), default=0) + 1
+    v = {
+        "id": vid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "author": author_id,
+        "author_name": get_display_name(user_profiles.get(author_id, {})) or "—",
+        "note": (note or "").strip()[:200],
+        "text": text,
+    }
+    versions.append(v)
+    _save_prompt_versions(versions)
+    save_prompt(text)   # активний промпт — звідси читає analyze_with_claude
+    logger.info(f"Prompt published v{vid} by {author_id} ({len(text)} chars)")
+    return v
+
+def rollback_prompt(version_id, author_id=None):
+    """Відкат до конкретної версії: публікує її текст як НОВУ версію (історія незмінна)."""
+    versions = _ensure_prompt_seed()
+    target = next((x for x in versions if x.get("id") == version_id), None)
+    if not target:
+        return None
+    return publish_prompt(target["text"], author_id, note=f"Відкат до v{version_id} ({target.get('ts','')})")
+
+def rollback_prompt_previous(author_id=None):
+    """Break-glass відкат до попередньої версії (без вибору). Для чат-резерву."""
+    versions = _ensure_prompt_seed()
+    if len(versions) < 2:
+        return None
+    return publish_prompt(versions[-2]["text"], author_id, note="Відкат до попередньої")
+
 # ─── ТРЕКІНГ ПОВІДОМЛЕНЬ (для очищення перед дайджестом) ─────────────────────
 
 # Трекінг повідомлень (таблиця chat) — для очищення чату перед дайджестом/переліком
@@ -845,11 +930,6 @@ async def receive_text(update, context):
         await process_shift_report(update, context)
         return
 
-    # Режим редагування промпту — приймаємо інструкцію ТЕКСТОМ (голос — у receive_voice)
-    if context.user_data.get('prompt_editing') and is_owner(user_id):
-        await process_prompt_text(update, context)
-        return
-
     # Режим комментария
     if context.user_data.get('commenting_on'):
         handled = await process_comment(update, context)
@@ -867,11 +947,6 @@ async def receive_voice(update, context):
     # Автовидалення голосового повідомлення користувача
     _bot = get_bot()
     schedule_delete(context, _bot, update.effective_chat.id, update.message.message_id, delay=AUTO_DELETE_DELAY)
-
-    # Режим редагування промпту (тільки для власника)
-    if context.user_data.get('prompt_editing') and is_owner(user_id):
-        await process_prompt_voice(update, context)
-        return
 
     if user_id not in user_profiles:
         msg = await update.message.reply_text("Спочатку зареєструйтесь: /start")
@@ -1330,7 +1405,9 @@ def _call_claude_sync(prompt, max_tokens=800):
         messages=[{"role": "user", "content": prompt}],
     )
 
-async def analyze_with_claude(text, profile, is_anonymous=False):
+async def analyze_with_claude(text, profile, is_anonymous=False, template_override=None):
+    """template_override — для «тесту на прикладі» в дашборді (прогнати чернетку промпту
+    на реальному повідомленні ДО публікації). За замовч. — активний промпт (prompt.json)."""
     fallback_restaurant = profile.get('restaurant', 'Терраса') or 'Терраса'
 
     def _fallback():
@@ -1340,7 +1417,7 @@ async def analyze_with_claude(text, profile, is_anonymous=False):
 
     try:
         role_line = "" if is_anonymous else f"Роль відправника: {profile.get('role', 'Невідомо')}\n"
-        template = load_prompt()
+        template = template_override or load_prompt()
         prompt = (template
             .replace("<<restaurant>>", profile.get('restaurant', 'Невідомо'))
             .replace("<<role_line>>", role_line)
@@ -2738,25 +2815,24 @@ def build_admin_menu_keyboard(user_id):
     """Меню залежно від ролі. «Адміністратор» (can_manage_tasks, але НЕ is_admin) —
     лише «Невиконані завдання»; повні адміни (Управляючий/Виконавчий директор/власник) —
     увесь набір; власник — додатково керування промптом."""
-    keyboard = [[InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")],
-                [InlineKeyboardButton("📝 Підсумки змін", callback_data="menu_shiftreports")]]
-    # Кнопка-вхід у Mini App «Пульт керівника» (лише якщо налаштовано публічний https URL).
+    # Аварійне (break-glass) чат-меню: повсякденне керування — у Пульті (Mini App).
+    # Тут лишається ЛИШЕ критичне на випадок недоступності Пульта/тунелю: персонал
+    # (підтвердити/роль/звільнити/відновити) і резерв промпту (перегляд + відкат).
+    # Прибрано в Пульт: доступи до закладів, підсумки змін, розмовне редагування промпту.
+    keyboard = []
     if WEBAPP_URL:
-        keyboard.insert(0, [InlineKeyboardButton("📊 Пульт керівника", web_app=WebAppInfo(url=WEBAPP_URL))])
+        keyboard.append([InlineKeyboardButton("📊 Пульт керівника", web_app=WebAppInfo(url=WEBAPP_URL))])
+    keyboard.append([InlineKeyboardButton("🔴 Невиконані завдання", callback_data="menu_unresolved")])
     if is_admin(user_id):
         keyboard += [
             [InlineKeyboardButton("👥 Список співробітників", callback_data="menu_staff")],
             [InlineKeyboardButton("⏳ Очікують підтвердження", callback_data="menu_pending")],
             [InlineKeyboardButton("🔄 Змінити роль", callback_data="menu_changerole")],
-            [InlineKeyboardButton("🏠 Доступ до закладів", callback_data="menu_venues")],
             [InlineKeyboardButton("❌ Звільнити", callback_data="menu_fire")],
             [InlineKeyboardButton("♻️ Відновити співробітника", callback_data="menu_restore")],
         ]
     if is_owner(user_id):
-        keyboard += [
-            [InlineKeyboardButton("📋 Поточний промпт", callback_data="menu_view_prompt")],
-            [InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")],
-        ]
+        keyboard.append([InlineKeyboardButton("📋 Промпт: перегляд / відкат", callback_data="menu_view_prompt")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -2955,73 +3031,31 @@ async def handle_admin_menu(update, context):
             await safe_answer(query, "Тільки для власника.", show_alert=True)
             return
         template = load_prompt()
-        display = template if len(template) <= 3800 else template[:3800] + "\n...(скорочено)"
+        display = template if len(template) <= 3500 else template[:3500] + "\n...(скорочено)"
         await query.edit_message_text(
-            f"📋 *Поточний промпт:*\n\n`{display}`",
+            f"📋 *Поточний промпт* (резерв; повне редагування — у Пульті):\n\n`{display}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Змінити промпт", callback_data="menu_edit_prompt")],
+                [InlineKeyboardButton("↩️ Відкат до попередньої версії", callback_data="menu_rollback_prompt")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="menu_back")],
             ])
         )
 
-    elif action == "edit_prompt":
+    elif action == "rollback_prompt":
         if not is_owner(user_id):
             await safe_answer(query, "Тільки для власника.", show_alert=True)
             return
-        # Ініціалізуємо стан тільки при першому вході
-        if not context.user_data.get('prompt_original'):
-            current = load_prompt()
-            context.user_data['prompt_original'] = current
-            context.user_data['prompt_working'] = current
-        context.user_data['prompt_editing'] = True
-        context.user_data['prompt_msg_id'] = query.message.message_id
-        context.user_data['prompt_chat_id'] = query.message.chat_id
-        working = context.user_data['prompt_working']
-        display = working if len(working) <= 3000 else working[:3000] + "\n...(скорочено)"
-        await query.edit_message_text(
-            f"✏️ *Режим редагування промпту*\n\n`{display}`\n\n"
-            "✍️ Надішліть інструкцію, що змінити — *текстом або голосом*.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Скасувати", callback_data="menu_cancel_edit_prompt")],
-            ])
-        )
-        cancel_user_jobs(context, user_id, "promptedit")
-        context.job_queue.run_once(
-            prompt_edit_timeout_callback,
-            when=300,
-            name=f"promptedit_{user_id}",
-            data={"user_id": user_id}
-        )
-
-    elif action == "accept_prompt":
-        if not is_owner(user_id):
-            await safe_answer(query, "Тільки для власника.", show_alert=True)
+        v = rollback_prompt_previous(user_id)
+        if not v:
+            await safe_answer(query, "Немає попередньої версії для відкату.", show_alert=True)
             return
-        cancel_user_jobs(context, user_id, "promptedit")
-        new_prompt = context.user_data.pop('prompt_working', None)
-        context.user_data.pop('prompt_original', None)
-        context.user_data.pop('prompt_editing', None)
-        context.user_data.pop('prompt_msg_id', None)
-        context.user_data.pop('prompt_chat_id', None)
-        if new_prompt:
-            save_prompt(new_prompt)
         await query.edit_message_text(
-            "✅ *Промпт збережено!*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ До меню", callback_data="menu_back")]])
-        )
+            f"↩️ Промпт відкочено до попередньої версії (нова v{v['id']} · {v['ts']}).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]))
 
-    elif action == "cancel_edit_prompt":
-        cancel_user_jobs(context, user_id, "promptedit")
-        context.user_data.pop('prompt_editing', None)
-        context.user_data.pop('prompt_working', None)
-        context.user_data.pop('prompt_original', None)
-        context.user_data.pop('prompt_msg_id', None)
-        context.user_data.pop('prompt_chat_id', None)
-        await query.edit_message_text("❌ Редагування скасовано.\n\n👨‍💼 *Адмін-меню*\nОберіть дію:",
-            reply_markup=build_admin_menu_keyboard(user_id), parse_mode="Markdown")
+    # Старе розмовне редагування промпту (edit_prompt/accept_prompt/cancel_edit_prompt) ВИДАЛЕНО:
+    # повне редагування — у Пульті (вкладка ⚙️, з версіями/відкатом). Єдиний писар prompt.json —
+    # publish_prompt. Тап по застарілій кнопці «✏️ Змінити промпт» зі старих повідомлень = no-op.
 
 async def show_unresolved(query, context):
     """Показує невиконані завдання з повною клавіатурою і історією."""

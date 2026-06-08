@@ -142,10 +142,12 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
 
 ### 4.8 Інше
 - Привітання з ДН (`send_birthday_greetings`, 06:00).
-- Адмін-меню (`show_admin_menu` / `handle_admin_menu`): список/очікують/зміна
-  ролі/звільнити/відновити; для власника — перегляд і **редагування промпту голосом АБО текстом**
-  (`process_prompt_voice`/`process_prompt_text` → `_apply_prompt_instruction` → `refine_prompt_with_claude`).
-  У режимі `prompt_editing` будь-який текст власника = інструкція що змінити (reply-кнопки меню — перевіряються раніше).
+- Адмін-меню (`show_admin_menu` / `handle_admin_menu`) — **аварійне (break-glass) чат-резерв**
+  (повсякденне керування — у Пульті, розд. 7.2). Лишилось критичне на випадок недоступності
+  Пульта/тунелю: персонал (список/очікують/зміна ролі/звільнити/відновити) і **резерв промпту**
+  (перегляд `menu_view_prompt` + відкат до попередньої `menu_rollback_prompt` → `rollback_prompt_previous`).
+  Прибрано в Пульт: доступи до закладів, підсумки змін, розмовне редагування промпту
+  (`process_prompt_voice`/`process_prompt_text` лишаються в коді, але з меню не викликаються).
 - Зміна ролі співробітником (заявка) і адміном.
 
 ---
@@ -240,17 +242,29 @@ Google Sheets. Є щоденний ранковий дайджест і ручн
   `import bot` дав би другий екземпляр з окремими кешами). `webapp_api` НЕ імпортує bot → без циклу.
 - **Lifecycle**: старт у `_post_init` (`webapp_api.start`, best-effort — збій НЕ валить бот), стоп у
   `_post_shutdown`. Конфіг: `WEBAPP_ENABLED/HOST/PORT/URL` у `.env`. Слухає лише `127.0.0.1`; назовні —
-  Cloudflare Tunnel (валідний https — вимога Telegram). Кнопка «📊 Пульт керівника» в адмін-меню лише
-  якщо задано `WEBAPP_URL`.
+  **Tailscale Funnel** (фактичний деплой; валідний https — вимога Telegram). Деталі — [WEBAPP_SETUP.md](WEBAPP_SETUP.md).
+- **Вхід**: надійна кнопка «☰ Пульт» (chat menu button, ставиться всім керівникам у `_post_init`,
+  `set_chat_menu_button`+`MenuButtonWebApp`) + inline «📊 Пульт керівника» в адмін-меню. Reply-web-app
+  кнопку НЕ вживаємо (на iOS не передає initData). Обидві лише якщо задано `WEBAPP_URL`.
+- **Анти-кеш**: index віддається з `Cache-Control: no-store` + `?v=<mtime>` до `app.js`/`style.css`
+  (`_asset_version`), тож Telegram завжди тягне свіжий фронт; `app.js` кешує initData у `sessionStorage`
+  (переживає перезавантаження webview під час рестарту бота).
 - **Авторизація**: `validate_init_data` — Telegram WebApp initData (HMAC-SHA256 токеном) + свіжість 24год.
   Гейт `/api/*` — `can_manage_tasks`. Усі права — на сервері, дзеркалять бота: дії над задачею —
   `can_act_on_task` (ядро); видалення/керівні ролі — `is_owner`; персонал — `is_admin`.
 - **Ендпоінти** (`/api/...`): `me`, `tasks` (GET список з фільтром за `visible_restaurants` + POST створити),
   `tasks/{fid}` (деталі), `photo/{fid}` (лише з дозволених тек E:/G: або фолбек по file_id), дії
   `status|delete|comment|assign`, `staff` (+ `venues/role/approve/reject/fire/restore`), `analytics`,
-  `shift-reports` (+ `/to-task`). **Будь-який gspread/Claude в API — теж лише через `_arun`** (не блокуй loop).
-- **Фронтенд** `webapp/` — чистий HTML/JS/CSS + офіційний `telegram-web-app.js`, тема через `--tg-theme-*`.
-  Увесь динамічний текст — через `esc()` (анти-XSS). Без білд-кроку.
+  `shift-reports` (+ `/to-task`), **`prompt`** (GET + POST publish + `/refine` + `/rollback` + `/test`).
+  **Будь-який gspread/Claude в API — теж лише через `_arun`** (не блокуй loop).
+- **Промпт (вкладка ⚙️, лише власник)**: активний промпт — у `prompt.json` (звідти читає `analyze_with_claude`),
+  історія версій — у SQLite `meta['prompt_versions']` (JSON, cap 40) — **єдине джерело**, тож дашборд і чат-резерв
+  не розходяться. `publish_prompt` (запис версії + `save_prompt`), `rollback_prompt`/`rollback_prompt_previous`,
+  `_ensure_prompt_seed`. Публікація вимагає 3 плейсхолдери (`<<restaurant>>/<<role_line>>/<<message_text>>`).
+  «AI-підказка» = `refine_prompt_with_claude` → результат у поле (НЕ автопублікує). «Тест на прикладі» =
+  `analyze_with_claude(..., template_override=чернетка)` ДО публікації. Усі prompt-ендпоінти гейтяться `is_owner`.
+- **Фронтенд** `webapp/` — чистий HTML/JS/CSS + офіційний `telegram-web-app.js`, тема через `--tg-theme-*`,
+  повний екран (`requestFullscreen` + safe-area). Увесь динамічний текст — через `esc()` (анти-XSS). Без білд-кроку.
 
 ## 8. Бекап і відомі обмеження
 - **Бекап БД** (3-2-1): `daily_backup` (05:30) → `VACUUM INTO` у `BACKUP_DIRS` (E: і G:), ротація
