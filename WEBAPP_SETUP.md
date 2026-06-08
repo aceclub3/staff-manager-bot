@@ -22,6 +22,27 @@
 
 ---
 
+## ✅ Як це РОЗГОРНУТО зараз: Tailscale Funnel (2026-06-08)
+
+Фактично використано **Tailscale Funnel** (без домену, безкоштовно), а не Cloudflare.
+Cloudflare-варіант лишено нижче як альтернативу.
+
+- Tailscale встановлено на сервері (`C:\Program Files\Tailscale\`), увійшли акаунтом **aceclub3 (GitHub)**.
+- Funnel піднято на порт дашборду:
+  ```powershell
+  & "C:\Program Files\Tailscale\tailscale.exe" funnel --bg 8081
+  ```
+  (одноразово треба було ввімкнути Funnel/HTTPS за посиланням, що видала команда).
+- Публічний адрес: **`https://server.tail7f319a.ts.net`** → проксі на `http://127.0.0.1:8081`.
+- У `.env`: `WEBAPP_URL=https://server.tail7f319a.ts.net`.
+- Конфіг Funnel **персистентний** (зберігається tailscaled) — підніметься сам разом зі службою Tailscale після перезавантаження сервера. Повторно команди не потрібні.
+- Перевірка: `https://server.tail7f319a.ts.net/health` → `{"ok": true}`.
+- Керування: `tailscale funnel status` (показати), `tailscale funnel --https=443 off` (вимкнути).
+
+> Якщо колись зміниться ім'я машини/tailnet — оновити `WEBAPP_URL` у `.env` і перезапустити бот.
+
+---
+
 ## Крок 1. Змінні в `.env`
 
 ```ini
@@ -37,7 +58,7 @@ WEBAPP_URL=                 # ПУБЛІЧНИЙ https-URL (заповнити �
 
 ---
 
-## Крок 2. Публічний HTTPS через Cloudflare Tunnel (безкоштовно)
+## Крок 2 (АЛЬТЕРНАТИВА, не використано). Публічний HTTPS через Cloudflare Tunnel
 
 Telegram вимагає, щоб сторінка Mini App відкривалась по **https з валідним
 сертифікатом**. Cloudflare Tunnel дає це безкоштовно, без білого IP і проброса портів.
