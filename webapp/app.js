@@ -3,7 +3,32 @@
 "use strict";
 const tg = window.Telegram && window.Telegram.WebApp;
 const INIT = (tg && tg.initData) || "";
-if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+
+function applySafeArea(){
+  if (!tg) return;
+  const sa = tg.safeAreaInset || {};
+  const ca = tg.contentSafeAreaInset || {};
+  const top = (Number(sa.top) || 0) + (Number(ca.top) || 0);
+  const bottom = (Number(sa.bottom) || 0) + (Number(ca.bottom) || 0);
+  document.documentElement.style.setProperty("--safe-top", top + "px");
+  document.documentElement.style.setProperty("--safe-bottom", bottom + "px");
+}
+function setupViewport(){
+  if (!tg) return;
+  try { tg.ready(); } catch (e) {}
+  try { tg.expand(); } catch (e) {}
+  // не закривати застосунок випадковим свайпом вниз під час скролу
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+  // повноекранний режим (Bot API 8.0+); на старіших клієнтах просто лишається expand()
+  try {
+    if (tg.requestFullscreen && (!tg.isVersionAtLeast || tg.isVersionAtLeast("8.0"))) tg.requestFullscreen();
+  } catch (e) {}
+  applySafeArea();
+  ["safeAreaChanged", "contentSafeAreaChanged", "fullscreenChanged", "viewportChanged"].forEach(ev => {
+    try { tg.onEvent && tg.onEvent(ev, applySafeArea); } catch (e) {}
+  });
+}
+setupViewport();
 
 const view = document.getElementById("view");
 const modal = document.getElementById("modal");

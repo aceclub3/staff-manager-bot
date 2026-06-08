@@ -14,12 +14,12 @@
 html,body{margin:0;padding:0;background:var(--sec);color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   font-size:15px;line-height:1.4}
-body{padding-bottom:72px}
+body{padding-bottom:calc(72px + var(--safe-bottom, 0px))}
 .muted,.hint{color:var(--hint)}
 .loading{padding:40px;text-align:center;color:var(--hint)}
 
 #topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;
-  gap:10px;padding:10px 14px;background:var(--bg);border-bottom:1px solid var(--border)}
+  gap:10px;padding:calc(10px + var(--safe-top, 0px)) 14px 10px;background:var(--bg);border-bottom:1px solid var(--border)}
 #topbar .who{display:flex;flex-direction:column;line-height:1.15;min-width:0}
 #who-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #who-role{font-size:12px}
@@ -27,7 +27,7 @@ body{padding-bottom:72px}
   font-size:18px;cursor:pointer}
 
 #tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;background:var(--bg);
-  border-top:1px solid var(--border)}
+  border-top:1px solid var(--border);padding-bottom:var(--safe-bottom, 0px)}
 .tab{flex:1;background:none;border:none;color:var(--hint);padding:8px 2px 10px;font-size:20px;
   display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer}
 .tab span{font-size:11px}
@@ -64,7 +64,7 @@ main{padding:12px 12px 8px}
 .btn.block{display:flex;width:100%}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn-row .btn{flex:1;min-width:84px}
-.fab{position:fixed;right:16px;bottom:84px;z-index:25;width:54px;height:54px;border-radius:50%;
+.fab{position:fixed;right:16px;bottom:calc(84px + var(--safe-bottom, 0px));z-index:25;width:54px;height:54px;border-radius:50%;
   background:var(--btn);color:var(--btn-text);border:none;font-size:28px;box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer}
 
 /* modal */
