@@ -68,7 +68,7 @@ URGENCY_ICONS = {"Висока": "🔥", "Стандартна": "", "Низьк
 # ─── МАРШРУТИЗАЦІЯ / ТЕРМІНОВІСТЬ / SLA / БЕКАП (аудит) ───────────────────────
 GROUP_ROLES = {"Виконавчий директор"}            # бачать усі заклади (як власник)
 VENUE_ROLES = {"Управляючий", "Адміністратор"}    # обмежені своїм закладом
-REALTIME_URGENCY = {"Висока", "Стандартна"}       # реалтайм-пінг; "Низька" — лише в дайджесті
+REALTIME_URGENCY = {"Висока", "Стандартна", "Низька"}  # усі нові задачі пінгуються в реалтаймі (ранковий дайджест прибрано 2026-06)
 SLA_HOURS = {"Висока": 2, "Стандартна": 24, "Низька": 72}
 ESCALATE_URGENCY = {"Висока"}                     # прострочені цих — ескалюємо власнику
 BACKUP_DIRS = [r"E:\Denys\Feedback\Бекап", r"G:\Мой диск\BOTS\Feedback\Бекап"]
@@ -1217,8 +1217,8 @@ def _store_task_photo(fid, file_id, path):
 
 
 async def _save_and_notify(results, user_data, profile, photo_file_id, context):
-    """Зберігає фото на диск (раз), створює задачі та (для термінових) розсилає сповіщення.
-    Низька терміновість — БЕЗ реалтайм-пінгу (лише в ранковому зведенні), щоб не перевантажувати.
+    """Зберігає фото на диск (раз), створює задачі та розсилає сповіщення.
+    Усі терміновості пінгуються в реалтаймі (ранковий дайджест прибрано — керування у Пульті).
     Повертає (categories, feedback_ids, delivery[])."""
     gdrive_path = ""
     if photo_file_id:
@@ -1251,13 +1251,8 @@ def _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery=None
     count_note = f" ({len(results)} проблеми)" if len(results) > 1 else ""
     photo_note = "\n📷 З фото" if photo_file_id else ""
     note = ""
-    if delivery:
-        realtime = [d for d in delivery if d["realtime"]]
-        digestonly = [d for d in delivery if not d["realtime"]]
-        if realtime and all(d["reached"] == 0 for d in realtime):
-            note = "\n⏳ Керівники зараз поза мережею — побачать у зведенні."
-        elif digestonly and not realtime:
-            note = "\n🟢 Зʼявиться у ранковому зведенні керівникам."
+    if delivery and all(d.get("reached", 0) == 0 for d in delivery):
+        note = "\n⏳ Керівники зараз поза мережею — побачать у Пульті (або щойно зайдуть онлайн)."
     result_lines = []
     for i, r in enumerate(results):
         if i > 0:
@@ -2626,7 +2621,8 @@ def build_row_text(row, fid, safe_id):
     return text, keyboard
 
 async def send_unresolved_digest(context):
-    """Відправляє о 06:00 UTC (09:00 Київ) дайджест:
+    """⚠️ БІЛЬШЕ НЕ ПЛАНУЄТЬСЯ автоматично (ранковий дайджест прибрано 2026-06; керування — у Пульті).
+    Лишено як break-glass для ручного виклику. Раніше відправляло о 06:00 UTC (09:00 Київ) дайджест:
     1. Видаляє попередні відстежені повідомлення у всіх отримувачів
     2. Повідомлення 1: виконані вчора (без кнопок)
     3. Повідомлення 2+: кожна невиконана задача окремо з кнопками
@@ -3522,7 +3518,12 @@ async def sla_sweep(context):
         logger.error(f"SLA sweep error: {e}")
 
 async def daily_backup(context):
-    """Щоденний узгоджений бекап feedback.db на E: і G: з ротацією (3-2-1)."""
+    """Щоденний узгоджений бекап feedback.db на E: і G: з ротацією (3-2-1).
+    Тут же — щоденне обслуговування ретенції звітів змін (раніше жило в дайджесті, який прибрано)."""
+    try:
+        _purge_old_shift_reports()
+    except Exception as e:
+        logger.error(f"Shift-report purge error: {e}")
     try:
         await _arun(storage.checkpoint)
     except Exception:
@@ -3594,7 +3595,9 @@ def main():
     application = app   # щоб get_bot() використовував єдиний керований bot
 
     job_queue = app.job_queue
-    job_queue.run_daily(send_unresolved_digest, time=datetime.strptime("06:00", "%H:%M").time())
+    # Ранковий дайджест прибрано (2026-06): керування — у Пульті, у Telegram ідуть лише нові задачі
+    # (реалтайм, усі терміновості) + ескалації прострочених (sla_sweep). Функції send_unresolved_digest/
+    # send_shift_reports_section лишено в коді як break-glass, але НЕ плануються автоматично.
     job_queue.run_daily(send_birthday_greetings, time=datetime.strptime("06:00", "%H:%M").time())
     job_queue.run_daily(daily_backup, time=datetime.strptime("05:30", "%H:%M").time())   # бекап БД
     job_queue.run_repeating(sla_sweep, interval=1800, first=300)        # ескалація/недоставлені, кожні 30 хв
