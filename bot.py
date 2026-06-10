@@ -1398,7 +1398,10 @@ def _extract_json(s):
                 continue
     return None
 
-def _call_claude_sync(prompt, max_tokens=800):
+# max_tokens=8192: довгий список задач (напр. 31 пункт) дає ~2300+ токенів JSON.
+# Старий ліміт 800 ОБРІЗАВ вивід (stop_reason=max_tokens) -> невалідний JSON ->
+# _fallback() звалював УВЕСЬ текст в одну задачу «Інше». 8192 = запас на ~100 задач.
+def _call_claude_sync(prompt, max_tokens=8192):
     return claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
