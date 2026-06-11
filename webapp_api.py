@@ -272,7 +272,7 @@ def _action_response(res):
     if res.get("ok"):
         return web.json_response({"ok": True, **{k: v for k, v in res.items() if k != "ok"}})
     err = res.get("error")
-    status = {"no_perm": 403, "owner_only": 403, "already_closed": 409,
+    status = {"no_perm": 403, "owner_only": 403, "already_closed": 409, "already_done": 409,
               "bad_target": 400, "empty": 400, "bad_action": 400,
               "bad_venue": 400, "not_found": 404}.get(err, 400)
     return web.json_response({"ok": False, "error": err, "status": res.get("status")}, status=status)
@@ -321,6 +321,14 @@ async def api_task_venue(request):
     fid = request.match_info["fid"]
     body = await _json_body(request)
     res = await B.task_action_set_venue(fid, body.get("restaurant"), uid)
+    return _action_response(res)
+
+
+async def api_task_to_shift_report(request):
+    """Перекваліфікувати задачу у підсумок зміни (виправлення хибної класифікації). Гейт — у ядрі (is_admin)."""
+    uid = request["uid"]
+    fid = request.match_info["fid"]
+    res = await B.task_action_to_shift_report(fid, uid)
     return _action_response(res)
 
 
@@ -712,6 +720,7 @@ def build_app():
     app.router.add_post("/api/tasks/{fid}/comment", api_comment)
     app.router.add_post("/api/tasks/{fid}/assign", api_assign)
     app.router.add_post("/api/tasks/{fid}/venue", api_task_venue)
+    app.router.add_post("/api/tasks/{fid}/to-shift-report", api_task_to_shift_report)
     app.router.add_get("/api/staff", api_staff)
     app.router.add_post("/api/staff/{tid}/venues", api_set_venues)
     app.router.add_post("/api/staff/{tid}/role", api_set_role)

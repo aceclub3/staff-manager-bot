@@ -62,6 +62,13 @@ ROLES = ["Офіціант", "Адміністратор", "Повар", "Шеф
 ADMIN_ROLES = {"Управляючий", "Виконавчий директор"}
 KITCHEN_CATEGORIES = {"Кухня", "Закупки"}
 CATEGORIES = ["Кухня", "Сервіс", "Техніка", "Закупки", "Гості", "Ідеї", "Чистота"]
+# Службова «категорія»-сентинел: повідомлення виявилось підсумком зміни (рефлексивний відгук),
+# а не задачею (працівник натиснув не ту кнопку). Класифікатор може її повернути; у потоці
+# працівника такі елементи маршрутизуються у shiftreports, а НЕ створюють задачу.
+SHIFT_REPORT_CATEGORY = "Підсумок зміни"
+# Префікс статусу для задачі, перекваліфікованої у підсумок зміни — щоб повторне натискання на
+# вже перенесеній задачі (в «закритих») не дублювало запис підсумку (ідемпотентність).
+RECLASSIFIED_STATUS_PREFIX = "Видалено — у підсумки змін"
 CATEGORY_ICONS = {"Кухня": "🍽️", "Сервіс": "👥", "Техніка": "🔧", "Закупки": "🛒", "Гості": "💬", "Ідеї": "💡", "Чистота": "🧹"}
 URGENCY_ICONS = {"Висока": "🔥", "Стандартна": "", "Низька": "🟢"}
 
@@ -1227,6 +1234,10 @@ async def _save_and_notify(results, user_data, profile, photo_file_id, context):
     categories, ids, delivery = [], [], []
     first_photo_sent = False
     for result in results:
+        # Захист: сюди приходять лише задачі. Якщо класифікатор повернув сентинел «Підсумок зміни»
+        # (а викликач не відмаршрутизував — напр. адмін явно створює задачу), трактуємо як «Інше».
+        if result.get("category") == SHIFT_REPORT_CATEGORY:
+            result["category"] = "Інше"
         feedback_id = create_task(result, user_data, profile, has_photos=bool(photo_file_id))
         urgency = result.get("urgency", "Стандартна")
         realtime = urgency in REALTIME_URGENCY
@@ -1268,6 +1279,39 @@ def _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery=None
     )
 
 
+def _route_shift_reports(results, user_id, profile, full_text, is_anonymous):
+    """AI ловить хибно натиснуту кнопку: елементи з category == SHIFT_REPORT_CATEGORY — це
+    рефлексивний підсумок зміни, а НЕ задача. Зберігаємо їх у shiftreports (як звичайний підсумок:
+    той самий день, той самий автор) і прибираємо зі списку задач. Повертає (task_results, shift_count).
+    Без telegram_id маршрутизувати ніяк (підсумок прив'язаний до людини) — лишаємо як задачі."""
+    if not user_id:
+        return list(results), 0
+    shift = [r for r in results if r.get("category") == SHIFT_REPORT_CATEGORY]
+    tasks = [r for r in results if r.get("category") != SHIFT_REPORT_CATEGORY]
+    saved = 0
+    for sr in shift:
+        body = (sr.get("summary") or full_text or "").strip()
+        if body:
+            save_shift_report(user_id, profile, body, "auto", is_anonymous)
+            saved += 1            # лічимо лише реально збережені (порожні не дають хибне «збережено»)
+    return tasks, saved
+
+
+def _build_combined_confirm(task_results, shift_count, is_anonymous, photo_file_id, ids, delivery=None):
+    """Підтвердження працівнику з урахуванням авто-перекваліфікації у підсумок зміни."""
+    if not task_results and shift_count:
+        # Суто підсумок зміни (поширений випадок — натиснули звичайне повідомлення замість кнопки).
+        anon_note = " (анонімно)" if is_anonymous else ""
+        photo_note = "\nℹ️ Фото не зберігається з підсумком зміни." if photo_file_id else ""
+        return (f"✅ Дякуємо! Це збережено як підсумок зміни{anon_note} (не задача) 🙏\n"
+                "Підказка: для підсумку зміни зручніше тиснути кнопку «📝 Підсумок зміни»."
+                + photo_note)
+    base = _build_confirm_text(task_results, is_anonymous, photo_file_id, ids, delivery)
+    if shift_count:
+        base += "\n\n📝 Окремо збережено як підсумок зміни."
+    return base
+
+
 async def process_message(query_or_update, context, profile, use_message=False):
     # Атомарне «захоплення» pending_message ДО будь-якого await — щоб автовідправка (20с)
     # і натискання кнопки не створили дубль задачі: хто другий, той отримає None і вийде.
@@ -1289,16 +1333,21 @@ async def process_message(query_or_update, context, profile, use_message=False):
 
     photo_file_id = context.user_data.pop('pending_photo', None)
     is_anonymous = context.user_data.get('is_anonymous', False)
+    _uid = profile.get('telegram_id')
 
     results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-    categories, ids, delivery = await _save_and_notify(results, context.user_data, profile, photo_file_id, context)
+    # Авто-маршрут: рефлексивний підсумок зміни (хибно натиснута кнопка) → у shiftreports, не в задачі.
+    task_results, shift_count = _route_shift_reports(results, _uid, profile, text, is_anonymous)
+    # Фото віддаємо лише якщо є задачі; для суто-підсумку фото не зберігається (підсумки без фото) —
+    # інакше save_photo_to_gdrive створив би «осиротілий» файл без задачі (user повідомлений у тексті).
+    categories, ids, delivery = await _save_and_notify(
+        task_results, context.user_data, profile, (photo_file_id if task_results else None), context)
 
     for key in ['waiting_for_option', 'waiting_for_photo', 'option_message_id', 'option_chat_id']:
         context.user_data.pop(key, None)
 
-    _uid = profile.get('telegram_id')
-    nudge = _shift_nudge_line() if _should_shift_nudge(_uid) else ""
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery) + nudge
+    nudge = _shift_nudge_line() if (not shift_count and _should_shift_nudge(_uid)) else ""
+    confirm_text = _build_combined_confirm(task_results, shift_count, is_anonymous, photo_file_id, ids, delivery) + nudge
     # БЕЗ reply_markup: це підтвердження автовидаляється (нижче). Reply-клавіатура
     # «прив'язана» до останнього повідомлення-носія, тож видалення носія прибрало б
     # постійні кнопки (зокрема «Адмін-меню»). Клавіатура й так живе на /start і в дайджесті.
@@ -1328,13 +1377,17 @@ async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     is_anonymous = user_data.get('is_anonymous', False)
 
     results = await analyze_with_claude(text, profile, is_anonymous=is_anonymous)
-    categories, ids, delivery = await _save_and_notify(results, user_data, profile, photo_file_id, context)
+    # Авто-маршрут: рефлексивний підсумок зміни (хибно натиснута кнопка) → у shiftreports, не в задачі.
+    task_results, shift_count = _route_shift_reports(results, user_id, profile, text, is_anonymous)
+    # Фото — лише для задач; суто-підсумок без фото (див. process_message).
+    categories, ids, delivery = await _save_and_notify(
+        task_results, user_data, profile, (photo_file_id if task_results else None), context)
 
     for key in ['waiting_for_option', 'waiting_for_photo']:
         user_data.pop(key, None)
 
-    nudge = _shift_nudge_line() if _should_shift_nudge(user_id) else ""
-    confirm_text = _build_confirm_text(results, is_anonymous, photo_file_id, ids, delivery) + nudge
+    nudge = _shift_nudge_line() if (not shift_count and _should_shift_nudge(user_id)) else ""
+    confirm_text = _build_combined_confirm(task_results, shift_count, is_anonymous, photo_file_id, ids, delivery) + nudge
     # БЕЗ reply_markup — див. коментар у process(): носій reply-клавіатури не можна автовидаляти.
     sent = await safe_send_message(bot, chat_id, confirm_text, parse_mode=None)
     if sent:
@@ -1438,7 +1491,7 @@ async def analyze_with_claude(text, profile, is_anonymous=False, template_overri
         if not isinstance(item, dict):
             continue
         cat = item.get("category", "Інше")
-        if cat not in CATEGORIES and cat != "Інше":
+        if cat not in CATEGORIES and cat not in ("Інше", SHIFT_REPORT_CATEGORY):
             cat = "Інше"
         item["category"] = cat
         if not item.get("restaurant"):
@@ -1921,6 +1974,86 @@ async def task_action_set_venue(feedback_id, new_restaurant, actor_id):
     asyncio.create_task(_mirror_venue_to_sheet(feedback_id, new_restaurant))
     logger.info(f"Task {feedback_id} venue {old} -> {new_restaurant} by {actor_id}")
     return {"ok": True, "restaurant": new_restaurant}
+
+
+async def task_action_to_shift_report(feedback_id, actor_id):
+    """Перекваліфікувати задачу у ПІДСУМОК ЗМІНИ (виправлення хибної класифікації: рефлексивний
+    відгук про зміну, а не задача). Власник + повні адміни (`is_admin`, як видалення/зміна закладу).
+    Створює запис у `shiftreports` з тексту/автора задачі (іде в Пульт → «Підсумки змін»), прибирає
+    задачу як видалену (живі повідомлення, кеші) і пише лог. Анонімність задачі зберігається.
+    Спільне для кнопки чату й дашборду — логіка в одному місці."""
+    if not is_admin(actor_id):
+        return {"ok": False, "error": "no_perm"}
+    rec = tasks_store.get(feedback_id)
+    if not rec:
+        return {"ok": False, "error": "not_found"}
+    # Ідемпотентність: вже перекваліфіковану задачу не переносимо вдруге (інакше дубль у підсумку).
+    # Звичайні «Виконано»/«Видалено» переносити МОЖНА (саме так виправляють хибну класифікацію).
+    if str(rec.get("status", "")).startswith(RECLASSIFIED_STATUS_PREFIX):
+        return {"ok": False, "error": "already_done"}
+    text = (rec.get("summary") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty"}
+
+    # 1) Запис у shiftreports. business_day = СЬОГОДНІ (день перекваліфікації), бо саме сьогодні/вчора
+    # показують усі екрани підсумків (Пульт і чат-резерв) — день створення задачі сховав би запис і
+    # міг би одразу потрапити під ретенцію. Реальний автор → зливаємо з його підсумком за сьогодні;
+    # анонімна задача (reporter_id=None) → синтетичний ключ, окремий запис.
+    business_day = datetime.now().strftime("%Y-%m-%d")
+    reporter_id = rec.get("reporter_id")
+    anon = not reporter_id
+    tg_key = reporter_id if reporter_id else f"conv-{feedback_id}"
+    key = f"{tg_key}:{business_day}"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing = reports_store.get(key)
+    if isinstance(existing, dict) and existing.get("text"):
+        existing["text"] = existing["text"].rstrip() + "\n— — —\n" + text
+        existing["updated_at"] = now
+        if anon:
+            existing["is_anonymous"] = True
+            existing["sender_name"] = None
+            existing["sender_role"] = None
+        srec = existing
+    else:
+        srec = {
+            "telegram_id": tg_key, "business_day": business_day,
+            "created_at": now, "updated_at": now,
+            "sender_name": None if anon else rec.get("sender_name"),
+            "sender_role": None if anon else rec.get("sender_role"),
+            "restaurant": rec.get("restaurant", "—"),
+            "is_anonymous": bool(anon), "text": text, "source": "converted",
+        }
+    reports_store[key] = srec
+    storage.kv_put("shiftreports", key, srec)
+    _shift_summary_cache.pop(business_day, None)
+    if SHIFT_REPORTS_TO_SHEET:
+        asyncio.create_task(_mirror_report_to_sheet(srec))
+
+    # 2) Прибираємо задачу (як task_action_delete): живі повідомлення, кеші, статус, лог.
+    who = get_display_name(user_profiles.get(actor_id, {}))
+    now_short = datetime.now().strftime("%d.%m %H:%M")
+    bot = get_bot()
+    msg_ids, _ = get_msg_data(feedback_id)
+    for uid_str, mid in list(msg_ids.items()):
+        ids = mid if isinstance(mid, list) else [mid]
+        for m in ids:
+            try:
+                await bot.delete_message(chat_id=int(uid_str), message_id=m)
+            except Exception:
+                pass
+    if feedback_id in msg_store:
+        del msg_store[feedback_id]
+        storage.kv_delete("msgstore", feedback_id)
+    if feedback_id in assign_store:
+        assign_store.pop(feedback_id, None)
+        save_assign_store(assign_store)
+    set_task_status(feedback_id, f"{RECLASSIFIED_STATUS_PREFIX} ({who})")
+    add_task_log(feedback_id, f"📝 Перенесено у підсумки зміни — {who} {now_short}")
+    # Закриваємо петлю з автором (не анонім, не сам виконавець) — його сповіщення зникло.
+    await _notify_reporter(rec, actor_id,
+                           f"ℹ️ Ваше повідомлення `{feedback_id}` перенесено у підсумки зміни (це не задача).")
+    logger.info(f"Task {feedback_id} -> shift report (key={key}) by {actor_id}")
+    return {"ok": True, "business_day": business_day}
 
 
 async def handle_status_update(update, context):

@@ -65,6 +65,7 @@ async function api(path, opts={}){
 function errText(e){
   const m = { unauthorized:"Не авторизовано (відкрийте через бота).", forbidden:"Немає доступу.",
     no_perm:"Немає прав на цю дію.", owner_only:"Лише власник.", already_closed:"Задачу вже закрито.",
+    already_done:"Вже перенесено у підсумки зміни.",
     bad_target:"Невірний виконавець.", empty:"Порожньо.", not_found:"Не знайдено.", internal:"Помилка сервера." };
   return m[e && e.message] || (e && e.message) || "Помилка";
 }
@@ -183,6 +184,11 @@ async function openTask(fid){
   const venueCtl = t.is_admin ? `<div class="hsec">🏠 Змінити заклад</div>
     <div class="btn-row" id="venuectl">${ME.all_restaurants.map(r =>
       `<button class="btn${r===t.restaurant?" primary":""}" data-venue="${esc(r)}">${esc(r)}</button>`).join("")}</div>` : "";
+  // не задача, а підсумок зміни (хибна класифікація / не та кнопка) — лише повні адміни/власник.
+  // Ховаємо для вже перенесених (щоб не дублювати), але лишаємо для звичайних «Виконано»/відкритих.
+  const alreadyShift = (t.status || "").startsWith("Видалено — у підсумки змін");
+  const reclassCtl = (t.is_admin && !alreadyShift) ? `<div class="hsec">📝 Не задача?</div>
+    <div class="btn-row"><button class="btn" id="toshift">↪️ Перенести у підсумки зміни</button></div>` : "";
   openModal(`<button class="close" onclick="closeModalGlobal()">✕</button>
     <h3>${t.category_icon} ${esc(t.category)} ${t.urgency_icon}</h3>
     <div class="kv"><span class="k">Номер</span><span class="fid">${esc(t.fid)}</span></div>
@@ -195,6 +201,7 @@ async function openTask(fid){
     <div class="kv"><span class="k">Створено</span><span>${esc(t.created_date)} ${esc(t.created_time)} · ⏰${t.age_days}д</span></div>
     ${t.has_photo?`<img class="detail-photo" id="dphoto" alt="фото">`:""}
     ${venueCtl}
+    ${reclassCtl}
     ${history}
     <div style="height:10px"></div>
     ${actions}`);
@@ -206,6 +213,17 @@ async function openTask(fid){
       haptic("success"); toast("Заклад → " + b.dataset.venue); openTask(t.fid); render(); }
     catch(e){ toast(errText(e)); }
   });
+  const toshiftBtn = document.getElementById("toshift");
+  if (toshiftBtn) toshiftBtn.onclick = () => {
+    const go = async () => {
+      try { await api(`/api/tasks/${encodeURIComponent(t.fid)}/to-shift-report`, {method:"POST", body:{}});
+        haptic("success"); toast("Перенесено у підсумки зміни"); closeModal(); render(); }
+      catch(e){ haptic("error"); toast(errText(e)); }
+    };
+    const q = "Перенести " + t.fid + " у підсумки зміни? Задача зникне зі списку.";
+    if (tg && tg.showConfirm) tg.showConfirm(q, ok => { if (ok) go(); });
+    else if (confirm(q)) go();
+  };
 }
 window.closeModalGlobal = closeModal;
 
