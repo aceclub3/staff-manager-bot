@@ -140,6 +140,13 @@ On-demand перелік невиконаних для одного адміна
   + окремі звіти з кнопкою «➕ Створити задачу» (`handle_report_to_task` → `analyze_with_claude`/`_save_and_notify`).
   `send_shift_reports_section` лишилась у коді (її кликав дайджест), але автоматично не викликається.
 - **Ескалація в задачу — лише вручну** (кнопка), ніколи автоматично.
+- **Авто-виявлення хибної кнопки** (2026-06): класифікатор має сентинел-категорію `SHIFT_REPORT_CATEGORY`
+  («Підсумок зміни», консервативне правило в `prompt.json`). Коли ВСЕ повідомлення працівника — рефлексія
+  про зміну без проблеми/дії, `_route_shift_reports` (у `process_message`/`_do_process`) зберігає його через
+  `save_shift_report`, а НЕ створює задачу. `_save_and_notify` коерсить сентинел→«Інше» (захист admin-створення).
+- **Зворотна перекваліфікація задача→підсумок** (виправлення хибної класифікації): `task_action_to_shift_report`
+  (`is_admin`) — кнопка в Пульті/ендпоінт `to-shift-report`. День підсумку = СЬОГОДНІ (щоб видно в Пульті/чаті),
+  задача стає `Видалено — у підсумки змін` (ідемпотентно, повторно не дублює).
 - Ретенція `SHIFT_REPORTS_RETENTION_DAYS` (14 дн.), чистка `_purge_old_shift_reports` — тепер у `daily_backup` (05:30).
 - М'який нудж «лиши підсумок» — один рядок у першому підтвердженні задачі за день (`_should_shift_nudge`,
   мітимо ПІСЛЯ успішної відправки). Опц. дзеркало в окрему вкладку Sheets — `SHIFT_REPORTS_TO_SHEET` (off).
@@ -261,7 +268,8 @@ On-demand перелік невиконаних для одного адміна
 - **Ендпоінти** (`/api/...`): `me`, `tasks` (GET список з фільтром за `visible_restaurants` + POST створити),
   `tasks/{fid}` (деталі), `photo/{fid}` (лише з дозволених тек E:/G: або фолбек по file_id), дії
   `status|delete|comment|assign|venue` (зміна закладу — `task_action_set_venue`, `is_admin`, виправлення
-  хибної класифікації Claude), `staff` (+ `venues/role/approve/reject/fire/restore`), `analytics`,
+  хибної класифікації Claude) | `to-shift-report` (перекваліфікація задача→підсумок зміни —
+  `task_action_to_shift_report`, `is_admin`; кнопка «↪️ Перенести у підсумки зміни»), `staff` (+ `venues/role/approve/reject/fire/restore`), `analytics`,
   `shift-reports` (+ `/to-task`), **`prompt`** (GET + POST publish + `/refine` + `/rollback` + `/test`).
   **Будь-який gspread/Claude в API — теж лише через `_arun`** (не блокуй loop).
 - **Промпт (вкладка ⚙️, лише власник)**: активний промпт — у `prompt.json` (звідти читає `analyze_with_claude`),
