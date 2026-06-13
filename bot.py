@@ -3547,6 +3547,51 @@ async def error_handler(update, context):
         pass
 
 
+def _backfill_wip_self_assign():
+    """Одноразово вирівнюємо СТАРІ задачі під нове правило: ті, що вже «В роботі», але висять
+    БЕЗ доручення, доручаємо тому, хто їх узяв (ім'я з «В роботі — Імʼя Прізвище»). Реверс-мапа
+    імен — лише з активних профілів; неоднозначні (двоє з тим самим імʼям) чи ненайдені — пропускаємо.
+    Узгоджено з in-memory кешами (assign_store/assignee_id) + БД. Гард `meta` → справді один раз
+    (щоб не «воскрешати» задачу, яку згодом свідомо зняли з доручення)."""
+    if storage.meta_get("wip_self_assign_backfill") == "1":
+        return 0
+    by_name = {}
+    for uid, p in user_profiles.items():
+        if p.get("status") == STATUS_ACTIVE:
+            by_name.setdefault(get_display_name(p), []).append(uid)
+    changed = 0
+    for fid, rec in list(tasks_store.items()):
+        status = str(rec.get("status", ""))
+        if not status.startswith("В роботі") or fid in assign_store or "—" not in status:
+            continue
+        who = status.split("—", 1)[1].strip()
+        uids = by_name.get(who)
+        if not uids or len(uids) != 1:
+            continue                      # неоднозначно або не знайдено — пропускаємо
+        uid = uids[0]
+        if not can_act_on_task(uid, rec.get("restaurant")):
+            continue
+        when = ""
+        ack = rec.get("acknowledged_at") or ""
+        if ack:
+            try:
+                when = datetime.strptime(ack, "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
+            except Exception:
+                when = ""
+        if not when:
+            when = f"{rec.get('created_date','')} {rec.get('created_time','')}".strip()
+        assign_store[fid] = {"assignee_id": uid, "assignee_name": who,
+                             "assigned_by": who, "assigned_at": when}
+        rec["assignee_id"] = uid
+        storage.save_task(rec)
+        changed += 1
+    if changed:
+        save_assign_store(assign_store)
+    storage.meta_set("wip_self_assign_backfill", "1")
+    logger.info(f"post_init: WIP self-assign backfill — {changed} task(s) assigned")
+    return changed
+
+
 async def _post_init(app):
     """Після завантаження persistence: прибрати тимчасовий стан, щоб старе фото/опис
     не причепились до нового повідомлення після перезапуску бота."""
@@ -3594,6 +3639,11 @@ async def _post_init(app):
         logger.info(f"post_init: tasks_store loaded ({len(tasks_store)})")
     except Exception as e:
         logger.error(f"post_init tasks load error: {e}")
+    # Одноразово: старі «В роботі» задачі без доручення — доручити тому, хто взяв (нове правило).
+    try:
+        _backfill_wip_self_assign()
+    except Exception as e:
+        logger.error(f"post_init wip-assign backfill error: {e}")
 
     # Дашборд «Пульт керівника» — aiohttp-сервер у ТОМУ Ж event-loop (best-effort:
     # збій сервера НЕ валить бот). Запускаємо після завантаження кешів.
