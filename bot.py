@@ -1798,6 +1798,12 @@ async def task_action_status(feedback_id, action, actor_id, fallback_text=None):
         return {"ok": False, "error": "no_perm"}
     if action == "wip" and _is_resolved(rec.get("status", "")):
         return {"ok": False, "error": "already_closed", "status": rec.get("status", "")}
+    # «В роботі» = людина бере задачу на себе → авто-доручення їй (тихо, без пінга самій собі),
+    # щоб задача не висіла «не доручено». Лише якщо ще нікому не доручено — не перехоплюємо чужу
+    # задачу. Делегуємо в ядро доручення (рул #12): права/денормалізація assignee_id/лог — в одному місці.
+    if action == "wip" and feedback_id not in assign_store:
+        await task_action_assign(feedback_id, actor_id, actor_id,
+                                 fallback_text=fallback_text, notify_target=False)
     profile = user_profiles.get(actor_id, {})
     who = get_display_name(profile)
     now = datetime.now().strftime("%d.%m %H:%M")
@@ -1889,9 +1895,11 @@ async def task_action_comment(feedback_id, actor_id, comment_text):
     add_task_log(feedback_id, comment_line_raw)
     return {"ok": True}
 
-async def task_action_assign(feedback_id, target_uid, actor_id, context=None, fallback_text=None):
+async def task_action_assign(feedback_id, target_uid, actor_id, context=None, fallback_text=None, notify_target=True):
     """Доручає задачу target_uid (перевірка прав). Спільне для кнопки і дашборду.
-    context — опц. (для автовидалення повідомлень); кнопковий хендлер сам показує підтвердження."""
+    context — опц. (для автовидалення повідомлень); кнопковий хендлер сам показує підтвердження.
+    notify_target=False — НЕ слати окреме повідомлення виконавцю (для авто-доручення на «В роботі»:
+    людина сама взяла задачу, пінгувати її про доручення самій собі зайве)."""
     rec = tasks_store.get(feedback_id, {})
     if not can_act_on_task(actor_id, rec.get("restaurant")):
         return {"ok": False, "error": "no_perm"}
@@ -1929,25 +1937,28 @@ async def task_action_assign(feedback_id, target_uid, actor_id, context=None, fa
     new_text = "\n".join(lines) + assign_line
     new_keyboard = build_task_keyboard(safe_id, assigned=True)
     await edit_all_messages(bot, feedback_id, new_text, new_keyboard)
-    # окреме повідомлення виконавцю (без статусів/доручення в тексті)
-    _, stored2 = get_msg_data(feedback_id)
-    base2 = stored2 if stored2 else (fallback_text or _fallback_task_text(feedback_id))
-    task_lines = [l for l in base2.split("\n") if not l.startswith(("✅", "🔄", "↩️", "👤 Доручено:"))]
-    task_text = "\n".join(task_lines).strip()
-    assignee_keyboard = build_task_keyboard(safe_id)
-    msg = await safe_send_message(
-        bot, target_uid,
-        f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {md(assigner_name)} {now}_",
-        reply_markup=assignee_keyboard, parse_mode="Markdown")
-    if msg is not None:
-        track_msg(target_uid, msg.message_id)
-        if context and getattr(context, "job_queue", None):
-            schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
-        if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict) and "ids" in msg_store[feedback_id]:
-            msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
-        else:
-            msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
-        storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
+    # окреме повідомлення виконавцю (без статусів/доручення в тексті).
+    # notify_target=False — авто-доручення на «В роботі»: виконавець САМ узяв задачу й уже бачить її
+    # у своєму повідомленні (його msg_id уже в msgstore), пінг про доручення самому собі зайвий.
+    if notify_target:
+        _, stored2 = get_msg_data(feedback_id)
+        base2 = stored2 if stored2 else (fallback_text or _fallback_task_text(feedback_id))
+        task_lines = [l for l in base2.split("\n") if not l.startswith(("✅", "🔄", "↩️", "👤 Доручено:"))]
+        task_text = "\n".join(task_lines).strip()
+        assignee_keyboard = build_task_keyboard(safe_id)
+        msg = await safe_send_message(
+            bot, target_uid,
+            f"📋 *Нове завдання — `{feedback_id}`*\n{task_text}\n\n_Доручив: {md(assigner_name)} {now}_",
+            reply_markup=assignee_keyboard, parse_mode="Markdown")
+        if msg is not None:
+            track_msg(target_uid, msg.message_id)
+            if context and getattr(context, "job_queue", None):
+                schedule_delete(context, bot, target_uid, msg.message_id, delay=TASK_DELETE_DELAY)
+            if feedback_id in msg_store and isinstance(msg_store[feedback_id], dict) and "ids" in msg_store[feedback_id]:
+                msg_store[feedback_id]["ids"][str(target_uid)] = msg.message_id
+            else:
+                msg_store[feedback_id] = {"ids": {str(target_uid): msg.message_id}, "text": task_text, "photo": None, "photo_path": ""}
+            storage.kv_put("msgstore", feedback_id, msg_store[feedback_id])
     add_task_log(feedback_id, f"👤 Доручено {target_name} — {assigner_name} {now}")
     return {"ok": True, "target_name": target_name}
 
