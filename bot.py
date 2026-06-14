@@ -1752,14 +1752,38 @@ async def send_notifications(result, user_data, profile, photo_file_id=None, fee
 
 # ─── СТАТУСИ ЗАДАЧ ────────────────────────────────────────────────────────────
 
+def _task_essence(rec):
+    """Короткий опис задачі (категорія · заклад + суть) для сповіщення автору — щоб було
+    зрозуміло, ЯКА саме задача (у Telegram немає посилання на повідомлення приватного чату)."""
+    if not isinstance(rec, dict):
+        return ""
+    cat = (rec.get("category") or "").strip()
+    rest = (rec.get("restaurant") or "").strip()
+    summary = (rec.get("summary") or "").strip()
+    head = []
+    if cat:
+        head.append(f"{CATEGORY_ICONS.get(cat, '📌')} {md(cat)}")
+    if rest:
+        head.append(md(rest))
+    out = []
+    if head:
+        out.append(" · ".join(head))
+    if summary:
+        s = summary if len(summary) <= 200 else summary[:200].rstrip() + "…"
+        out.append(f"_{md(s)}_")
+    return "\n".join(out)
+
 async def _notify_reporter(rec, actor_id, text):
     """Сповіщає автора задачі про результат (закриття петлі). Поважає анонімність
-    (reporter_id=None для анонімних), не пінгує самого виконавця."""
+    (reporter_id=None для анонімних), не пінгує самого виконавця. Додає суть задачі
+    (категорія/заклад/опис), щоб автор бачив, ЩО саме виконали/закрили."""
     rid = rec.get("reporter_id") if isinstance(rec, dict) else None
     if not rid or rid == actor_id:
         return
+    essence = _task_essence(rec)
+    body = f"{text}\n{essence}" if essence else text
     try:
-        await safe_send_message(get_bot(), rid, text, parse_mode="Markdown")
+        await safe_send_message(get_bot(), rid, body, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"reporter notify failed: {e}")
 
