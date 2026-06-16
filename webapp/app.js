@@ -410,7 +410,7 @@ async function venuesDialog(uid, name){
   };
 }
 function roleDialog(uid, name){
-  const roles=["Офіціант","Адміністратор","Повар","Шеф-повар","Управляючий","Виконавчий директор","Технічний спеціаліст","Клінінг"];
+  const roles=["Офіціант","Бармен","Адміністратор","Повар","Шеф-повар","Управляючий","Виконавчий директор","Технічний спеціаліст","Клінінг"];
   const opts=roles.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join("");
   openModal(`<button class="close" onclick="closeModalGlobal()">✕</button>
     <h3>🔄 Роль: ${esc(name)}</h3><select id="rl">${opts}</select>
