@@ -26,6 +26,7 @@ import time
 import shutil
 import html
 import threading
+import httpx
 from telegram.error import BadRequest, RetryAfter, Forbidden, TimedOut, NetworkError
 from telegram.ext import PicklePersistence
 from telegram.helpers import escape_markdown
@@ -1351,11 +1352,12 @@ async def process_message(query_or_update, context, profile, use_message=False):
     # БЕЗ reply_markup: це підтвердження автовидаляється (нижче). Reply-клавіатура
     # «прив'язана» до останнього повідомлення-носія, тож видалення носія прибрало б
     # постійні кнопки (зокрема «Адмін-меню»). Клавіатура й так живе на /start і в дайджесті.
-    sent = await target.reply_text(confirm_text)
-    if sent and nudge:
-        _mark_shift_nudged(_uid)
-    # Видаляємо підтвердження через 90 сек
-    schedule_delete(context, get_bot(), sent.chat_id, sent.message_id, delay=90)
+    sent = await safe_send_message(get_bot(), target.chat_id, confirm_text, parse_mode=None)
+    if sent:
+        if nudge:
+            _mark_shift_nudged(_uid)
+        # Видаляємо підтвердження через 90 сек
+        schedule_delete(context, get_bot(), sent.chat_id, sent.message_id, delay=90)
 
 async def _do_process(bot, chat_id, user_id, user_data, profile, context=None):
     """Вспомогательная функция для автоотправки (без query объекта)."""
@@ -3557,10 +3559,44 @@ async def cmd_fire(update, context):
 
 _last_error_notify = 0.0
 
+def _is_transient_network_error(err) -> bool:
+    """Разовий мережевий збій (502 Bad Gateway, таймаут, обрив з'єднання, flood-wait):
+    PTB сам перепідключається, тож власника такими НЕ будимо — лишаємо лише слід у лозі.
+    УВАГА: у PTB BadRequest успадковується від NetworkError — його глушити НЕ можна
+    (це справжні помилки: битий Markdown, message not found тощо)."""
+    if isinstance(err, RetryAfter):
+        return True
+    if isinstance(err, NetworkError) and not isinstance(err, BadRequest):
+        return True  # TimedOut, 502/5xx, обгорнуті httpx.ReadError/ConnectError і т.п.
+    if isinstance(err, (httpx.TransportError, TimeoutError)):
+        return True  # запас: сирий httpx / TimeoutError, якщо колись з'являться поза PTB
+    return False
+
 async def error_handler(update, context):
     """Глобальний обробник — жодна помилка більше не зникає тихо."""
     global _last_error_notify
-    logger.error("Unhandled exception while handling update", exc_info=context.error)
+    if _is_transient_network_error(context.error):
+        if update is None:
+            # Збій у polling/job-контексті (PTB передає update=None) — перепідключення
+            # автоматичне, власника не будимо, лишаємо лише слід у лозі.
+            logger.warning("Transient network error (owner NOT notified): %s", context.error)
+            return
+        # Збій ПІД ЧАС обробки апдейту: Telegram цей апдейт уже «спожив» і не повторить,
+        # повідомлення працівника могло втратитися — просимо надіслати ще раз,
+        # а власника повідомляємо нижче, як і про звичайну помилку.
+        logger.error("Transient network error while handling update — message may be lost",
+                     exc_info=context.error)
+        try:
+            chat = update.effective_chat if isinstance(update, Update) else None
+            if chat:
+                await safe_send_message(get_bot(), chat.id,
+                    "⚠️ Стався збій зв'язку з Telegram — повідомлення могло не зберегтися. "
+                    "Надішліть його, будь ласка, ще раз.",
+                    parse_mode=None)
+        except Exception:
+            pass
+    else:
+        logger.error("Unhandled exception while handling update", exc_info=context.error)
     try:
         now = time.time()
         if OWNER_IDS and (now - _last_error_notify) > 60:   # не частіше разу на хвилину
