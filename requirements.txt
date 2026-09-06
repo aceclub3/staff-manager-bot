@@ -5,3 +5,4 @@ gspread==6.1.2
 google-auth==2.34.0
 google-api-python-client==2.140.0
 python-dotenv==1.0.1
+httpx<0.28
