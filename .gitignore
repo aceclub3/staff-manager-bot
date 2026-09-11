@@ -24,3 +24,6 @@ bot_log.txt
 
 # local archive of old scripts
 Архив/
+
+# single-instance lock (fcntl)
+*.lock

@@ -13,21 +13,36 @@ Google Sheets. Керування — у Пульті (Mini App); у Telegram і
 
 ## 1. Як запускається і перезапускається
 
-- Запуск: `python -u C:\bots\feedback_bot\bot.py` (polling, не webhook).
-- Процесом керує **UniversalBotWatchdog** — заплана­ована задача
-  (`C:\bots\universal_watchdog.ps1`), що працює **як Адміністратор** і
-  **автоматично перезапускає** бот через ~10с після падіння. Логи кожного
-  запуску: `C:\bots\feedback_bot\logs\output_*.log` та `error_*.log`.
-- **Перезапуск після правок** (потрібна ЕЛЕВОВАНА сесія, бо процес
-  високоцілісний): у PowerShell «від імені адміністратора»:
-  ```powershell
-  Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*feedback_bot*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-  ```
-  Watchdog підніме новий код. Або `C:\bots\restart_all_bots.bat` (перезапускає
-  ВСІ боти). Неелевована сесія отримає `Access denied`.
-- Ознака, що піднявся новий код: у логу є рядок `post_init: transient user_data cleared`.
+Бот працює на сервері **ace-main** (Hetzner, `95.216.10.169`) як systemd-сервіс `feedback-bot`
+під користувачем `bots`, робоча копія — `/opt/bots/feedback_bot`, запуск
+`venv/bin/python bot.py` (polling, не webhook).
+
+| Дія | Команда (на ace-main) |
+|---|---|
+| Стан | `systemctl is-active feedback-bot` |
+| Перезапуск після правок | `sudo systemctl restart feedback-bot` |
+| Лог (живий) | `journalctl -u feedback-bot -f` |
+| Лог (файл) | `/var/log/bots/feedback-bot.log` |
+
+- **Ознака, що піднявся новий код**: у лозі свіжий рядок `post_init: transient user_data cleared`.
+- **Викат правок** — `git pull --rebase` у `/opt/bots/feedback_bot` + `sudo systemctl restart feedback-bot`.
+  `deploy-bots` цей репозиторій НЕ покриває (він знає лише iiko-ap/atmosphere/bots-common і скидає
+  на `origin/main`, а тут гілка `master`).
+- **Один екземпляр — фізично.** При старті `bot.py` бере `flock` на `feedback_bot.lock` (поруч із
+  `bot.py`) ДО звернення до БД і Telegram. Другий процес виходить з кодом 2 і рядком
+  «Другий екземпляр не запущено: замок тримає pid …». Тому `venv/bin/python bot.py` руками при
+  живому сервісі безпечний — він просто не стартує. Замок знімає ОС, `kill -9` його не лишає.
+- **Лог і токен.** `httpx`/`httpcore` приглушені до WARNING (їхній INFO друкував повний URL
+  Bot API — тобто токен), плюс формувач кореневого логера витирає `bot<цифри>:<…>` з готового
+  рядка разом із traceback. Токен у лог не потрапляє — не повертай ці два запобіжники.
+  Ротація — `/etc/logrotate.d/bots` (weekly, 8, `copytruncate`: systemd тримає файл відкритим).
+- **409 Conflict — не аварія.** Telegram віддає getUpdates лише одному споживачу токена; 409
+  означає, що токеном опитує ще хтось. PTB продовжує polling і відновлюється сам за ~10 с, тому
+  в лозі WARNING, а власнику — окремий текст і не частіше разу на добу (`_handle_conflict`),
+  НЕ загальне «⚠️ Помилка бота».
+- **Windows-машина — не місце запуску.** Стара схема (`C:\bots\feedback_bot` + планувальник
+  `UniversalBotWatchdog`) вимкнена 05.09.2026. Якщо бот там колись підніметься — він відбиратиме
+  getUpdates у бойового (ті самі 409). Сесії на Windows: цей бот перезапускається ЛИШЕ на ace-main.
 
 ---
 
@@ -301,13 +316,18 @@ On-demand перелік невиконаних для одного адміна
 
 ---
 
-## Де що крутиться (оновлено 06.09.2026)
+## Де що крутиться (оновлено 11.09.2026)
 
 Бот з 05.09.2026 працює на власному сервері **ace-main** (Hetzner, Гельсінкі, `95.216.10.169`)
 як systemd-сервіс `feedback-bot` під користувачем `bots`, а не на Windows.
 Живий стан: `ssh -i /e/bots/hetzner/hetzner_ed25519 root@95.216.10.169 "systemctl status feedback-bot"`,
-лог — `journalctl -u feedback-bot -f`. Деплой: push у `master` (у цього репо гілка саме `master`)
-→ на сервері `deploy-bots common` (або перезапуск сервісу). Правити код на сервері руками — ні.
+лог — `journalctl -u feedback-bot -f` або `/var/log/bots/feedback-bot.log`.
+
+**Викат: `git pull --rebase` у `/opt/bots/feedback_bot` + `sudo systemctl restart feedback-bot`.**
+`deploy-bots common` тут НЕ працює — цей скрипт покриває лише iiko-ap/atmosphere/bots-common і
+скидає на `origin/main`, а гілка цього репо — `master`. Робоча копія на сервері = бойовий код,
+тож правити її можна, але коміт і пуш — одразу, інакше наступний `git pull --rebase` упреться
+в незакомічене. Подробиці запуску, замка одного екземпляра й політики 409 — розд. 1.
 
 **Повна мапа серверів** — `E:\bots\SERVERS.md`: що працює на ace-main, що на паузі, що в хмарі.
 Тестовий сервер iiko-lab (`91.99.89.63`) з 06.09 зупинено — не звертайся до нього.

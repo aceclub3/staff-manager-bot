@@ -27,14 +27,74 @@ import shutil
 import html
 import threading
 import httpx
-from telegram.error import BadRequest, RetryAfter, Forbidden, TimedOut, NetworkError
+from telegram.error import BadRequest, RetryAfter, Forbidden, TimedOut, NetworkError, Conflict
 from telegram.ext import PicklePersistence
 from telegram.helpers import escape_markdown
 
 import storage  # єдина локальна база SQLite (feedback.db)
 
-logging.basicConfig(stream=sys.stdout, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(stream=sys.stdout, format=_LOG_FORMAT, level=logging.INFO)
+
+# ─── Токен бота НЕ потрапляє в лог ────────────────────────────────────────────
+# (а) httpx на рівні INFO друкує повний URL кожного запиту, а в Telegram Bot API токен —
+#     частина шляху (`https://api.telegram.org/bot<TOKEN>/getUpdates`). Тому httpx/httpcore
+#     тримаємо на WARNING: їхні INFO-рядки нам не потрібні, а витік токена — реальний.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# (б) Страховка на випадок, коли токен приїде звідкись іще (текст винятку, traceback,
+#     чужа бібліотека): чистимо вже ГОТОВИЙ рядок, тож під фільтр потрапляє геть усе.
+_TOKEN_IN_LOG_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{30,}")
+
+
+class _TokenScrubbingFormatter(logging.Formatter):
+    def format(self, record):
+        return _TOKEN_IN_LOG_RE.sub("bot<TOKEN>", super().format(record))
+
+
+for _h in logging.getLogger().handlers:
+    _h.setFormatter(_TokenScrubbingFormatter(_LOG_FORMAT))
+
 logger = logging.getLogger(__name__)
+
+# ─── Замок від другого екземпляра ─────────────────────────────────────────────
+# Два процеси з одним токеном = 409 Conflict у Telegram і задачі, що губляться між
+# поллерами. Беремо його ЯКНАЙРАНІШЕ — до БД і до першого звернення в Telegram.
+_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback_bot.lock")
+_lock_fd = None   # глобальна навмисно: закриється дескриптор — відпустить замок
+
+
+def _acquire_single_instance_lock():
+    """Ексклюзивний flock на `feedback_bot.lock`. Не взявся — виходимо з кодом 2, не
+    заважаючи тому, хто вже працює. Замок знімає сама ОС, тож падіння/kill -9 його не залишає."""
+    global _lock_fd
+    try:
+        import fcntl
+    except ImportError:
+        logger.warning("fcntl недоступний (не Linux) — замок від другого екземпляра пропущено")
+        return
+    fd = open(_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            fd.seek(0)
+            holder = fd.read().strip() or "невідомий"
+        except Exception:
+            holder = "невідомий"
+        fd.close()
+        logger.error("Другий екземпляр не запущено: замок тримає pid %s (%s)", holder, _LOCK_PATH)
+        sys.exit(2)
+    fd.seek(0)
+    fd.truncate()
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _lock_fd = fd
+    logger.info("Замок одного екземпляра взято (pid %s)", os.getpid())
+
+
+_acquire_single_instance_lock()
 
 # Ініціалізуємо БД і одноразово мігруємо старі JSON-стори (якщо таблиці порожні).
 storage.init()
@@ -3559,6 +3619,40 @@ async def cmd_fire(update, context):
 
 _last_error_notify = 0.0
 
+# 409 Conflict: Telegram віддає getUpdates лише ОДНОМУ споживачу токена. Отже, 409 — не
+# поломка нашого бота, а знак, що токеном опитує ще хтось. PTB після такої відповіді
+# продовжує polling і сам відновлюється за ~10 с, тож у лог — WARNING, а власнику —
+# не частіше разу на добу (свій лічильник, окремий від хвилинного _last_error_notify).
+_CONFLICT_NOTIFY_INTERVAL = 24 * 3600
+_last_conflict_notify = 0.0
+_conflict_day = ""
+_conflict_count = 0
+
+
+async def _handle_conflict(err):
+    global _conflict_day, _conflict_count, _last_conflict_notify
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today != _conflict_day:
+        _conflict_day, _conflict_count = today, 0
+    _conflict_count += 1
+    logger.warning("409 Conflict (%d-й за добу): інший процес викликав getUpdates нашим токеном; "
+                   "PTB продовжує polling і відновиться сам. %s", _conflict_count, err)
+    now = time.time()
+    if not OWNER_IDS or (now - _last_conflict_notify) <= _CONFLICT_NOTIFY_INTERVAL:
+        return
+    _last_conflict_notify = now
+    try:
+        await safe_send_message(
+            get_bot(), OWNER_IDS[0],
+            f"ℹ️ Хтось ще опитує Telegram токеном цього бота (409 Conflict, {_conflict_count}-й раз за добу). "
+            "Бот на ace-main працює далі й відновився сам. Якщо це не ви — перевірте Windows: "
+            "E:\\bots\\feedback_bot (logs\\output_*.log, планувальник UniversalBotWatchdog). "
+            "Наступне таке повідомлення — не раніше ніж через добу.",
+            parse_mode=None)
+    except Exception:
+        pass
+
+
 def _is_transient_network_error(err) -> bool:
     """Разовий мережевий збій (502 Bad Gateway, таймаут, обрив з'єднання, flood-wait):
     PTB сам перепідключається, тож власника такими НЕ будимо — лишаємо лише слід у лозі.
@@ -3575,6 +3669,11 @@ def _is_transient_network_error(err) -> bool:
 async def error_handler(update, context):
     """Глобальний обробник — жодна помилка більше не зникає тихо."""
     global _last_error_notify
+    if isinstance(context.error, Conflict):
+        # Окрема гілка ДО загального шляху: Conflict — нащадок TelegramError (не NetworkError),
+        # тож без цього він доходив би до «⚠️ Помилка бота» і будив власника щоразу.
+        await _handle_conflict(context.error)
+        return
     if _is_transient_network_error(context.error):
         if update is None:
             # Збій у polling/job-контексті (PTB передає update=None) — перепідключення
