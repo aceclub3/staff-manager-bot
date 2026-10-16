@@ -179,6 +179,10 @@ if WEBAPP_ENABLED:
     except Exception as e:
         logger.error(f"Mini App (webapp_api) недоступний, бот працює без дашборду: {e}")
 
+# Пароль до бек-офісу iiko-ap (/password, задача 212 iiko-ap): окремий модуль, живий бот інʼєктується так само
+import iiko_password
+iiko_password.init(sys.modules[__name__])
+
 # ─── НАДІЙНЕ ЗБЕРІГАННЯ JSON (атомарний запис + відновлення) ──────────────────
 
 def _atomic_write_json(path, data, ensure_ascii=False, indent=2):
@@ -4001,6 +4005,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_venue_user, pattern="^venueuser_"))
     app.add_handler(CallbackQueryHandler(handle_venue_toggle, pattern="^vtoggle_"))
     app.add_handler(CallbackQueryHandler(handle_venue_all, pattern="^vall_"))
+    # /password — пароль до бек-офісу iiko-ap (iiko_password.py); контакт поза реєстрацією і «Не зараз» — до receive_text
+    app.add_handler(CommandHandler(iiko_password.CMD, iiko_password.cmd_password))
+    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, iiko_password.on_contact))
+    app.add_handler(MessageHandler(filters.Text([iiko_password.CANCEL_BTN]) & filters.ChatType.PRIVATE, iiko_password.on_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
     app.add_handler(MessageHandler(filters.VOICE, receive_voice))
 
